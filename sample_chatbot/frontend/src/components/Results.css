@@ -1,0 +1,80 @@
+.w-60 {
+    width: 60% !important;
+    max-width: 60% !important;
+  }
+  .modal-content {
+    border: 1px solid white !important;
+  }
+  .modal-header .btn-close {
+    color: white;
+    filter: invert(1) grayscale(100%) brightness(200%);
+  }
+  .custom-header-modal .btn-close{
+    filter: none;
+  }
+  .csv-link {
+    display: block;
+    margin-top: 8px;
+    margin-bottom: 8px;
+  }
+  .cursor-pointer {
+    cursor: pointer;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-bottom: 1rem;
+    color: white;
+    table-layout: fixed;
+  }
+  th, td {
+    border: 1px solid #444;
+    padding: 8px;
+    text-align: left;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+  }
+  th {
+    background-color: #333;
+    font-weight: bold;
+  }
+  tr:nth-child(even) {
+    background-color: #2a2a2a;
+  }
+  .graph-image {
+    max-width: 100%;
+    height: auto;
+    object-fit: contain;
+  }
+  .related-tables {
+    margin-top: 10px;
+  }
+  .w-100 {
+    width: 100% !important;
+  }
+  .table-responsive {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .custom-table {
+    width: 100%;
+    min-width: 300px;
+  }
+  .custom-table th,
+  .custom-table td {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+  }
+  .mt-2 {
+    margin-top: 0.5rem;
+  }
+  .card {
+    width: 100%;
+    overflow-wrap: break-word;
+    word-wrap: break-word;
+  }
+  .card-body {
+    overflow: hidden;
+  }
