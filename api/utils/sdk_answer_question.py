@@ -26,7 +26,7 @@ def process_sql_category(request, vector_search_tables, category_response, auth,
             query=vql_query, 
             llm_provider=request.sql_gen_provider, 
             llm_model=request.sql_gen_model
-        ) if vql_query != "" else (vql_query, None)
+        )
 
     execution_result, vql_status_code, timings = execute_query(
         vql_query=vql_query, 

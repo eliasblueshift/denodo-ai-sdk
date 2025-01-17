@@ -106,7 +106,7 @@ def wait_for_chatbot(process, log_file_path, timeout=DEFAULT_TIMEOUT, no_logs=Fa
             if line:
                 print(line.strip())
                 if "Running on" in line:
-                    match = re.search(r"Running on (https?://[\d.:]+)", line)
+                    match = re.search(r"Running on (https?://[\w.:]+)", line)
                     if match:
                         print(f"Chatbot is running on: {match.group(1)}")
                         found_running = True
@@ -119,9 +119,9 @@ def wait_for_chatbot(process, log_file_path, timeout=DEFAULT_TIMEOUT, no_logs=Fa
                     log_file.write(line.strip() + '\n')
                     log_file.flush()
                     if "Running on" in line:
-                        match = re.search(r"Running on (https?://[\d.:]+)", line)
+                        match = re.search(r"Running on (https?://[\w.:]+)", line)
                         if match:
-                            print(f"Chatbot is running on: {match.group(1)}")
+                            print(f"Sample chatbot is running on: {match.group(1)}")
                             found_running = True
                             break
     return found_running
@@ -132,9 +132,13 @@ def log_output(process, log_file):
             log_file.write(line)
             log_file.flush()
             if "Uvicorn running on" in line:
-                match = re.search(r"Uvicorn running on (https?://[\d.:]+)", line)
+                match = re.search(r"Uvicorn running on (https?://[\w.:]+)", line)
                 if match:
-                    print(f"API is running on: {match.group(1)}")
+                    print(f"AI SDK is running on: {match.group(1)}. Swagger docs available at: {match.group(1)}/docs")
+            elif "AI SDK Version" in line:
+                match = re.search(r"Version:\s(.*)", line)
+                if match:
+                    print(f"AI SDK Version: {match.group(1)}")
     except ValueError as e:
         if "I/O operation on closed file" in str(e):
             print("Warning: Log file was closed before all output was written.")

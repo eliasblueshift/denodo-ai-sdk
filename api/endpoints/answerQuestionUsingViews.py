@@ -71,8 +71,8 @@ class answerQuestionUsingViewsResponse(BaseModel):
     llm_time: float
     total_execution_time: float
 
-@router.get('/answerQuestionUsingViews', response_class = JSONResponse, response_model = answerQuestionUsingViewsResponse)
-def answerQuestionUsingViews(endpoint_request: answerQuestionUsingViewsRequest = Depends(), auth: str = Depends(authenticate)):
+@router.post('/answerQuestionUsingViews', response_class = JSONResponse, response_model = answerQuestionUsingViewsResponse, tags = ['Ask a Question - Custom Vector Store'])
+def answerQuestionUsingViews(endpoint_request: answerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
     """
     The only difference between this endpoint and `answerQuestion` is that this endpoint 
     expects the result of the vector search to be passed in as a parameter.

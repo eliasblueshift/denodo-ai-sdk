@@ -42,6 +42,7 @@ def get_views_metadata_documents(
 ):
     """
     Retrieve JSON documents from views metadata with support for OAuth token or Basic auth.
+    Handles both legacy and paginated API versions automatically.
     
     Args:
         database_name: Name of the database to query
@@ -60,27 +61,35 @@ def get_views_metadata_documents(
     """
     logging.info(f"Starting to retrieve views metadata with {examples_per_table} examples per view on {database_name}")
     
-    # Prepare request data
-    data = {
-        "dataMode": data_mode,
-        "databaseName": database_name,
-        "dataUsage": examples_per_table > 0
-    }
-    
-    if examples_per_table > 0:
-        data["dataUsageConfiguration"] = {
-            "tuplesToUse": examples_per_table,
-            "samplingMethod": "random"
+    def prepare_request_data(offset=None, limit=None):
+        data = {
+            "dataMode": data_mode,
+            "databaseName": database_name,
+            "dataUsage": examples_per_table > 0,
         }
+        
+        if examples_per_table > 0:
+            data["dataUsageConfiguration"] = {
+                "tuplesToUse": examples_per_table,
+                "samplingMethod": "random"
+            }
+        
+        # Add pagination parameters only if specified
+        if offset is not None:
+            data["offset"] = offset
+        if limit is not None:
+            data["limit"] = limit
+            
+        return data
 
-    # Prepare headers based on auth type
-    headers = {'Content-Type': 'application/json'}
-    if isinstance(auth, tuple):
-        headers['Authorization'] = calculate_basic_auth_authorization_header(*auth)
-    else:
-        headers['Authorization'] = f'Bearer {auth}'
+    def make_request(data):
+        headers = {'Content-Type': 'application/json'}
+        if isinstance(auth, tuple):
+            headers['Authorization'] = calculate_basic_auth_authorization_header(*auth)
+        else:
+            headers['Authorization'] = f'Bearer {auth}'
 
-    try:
+        # 1. Make request and raise any connection/HTTP errors
         response = requests.post(
             f"{metadata_url}?serverId={server_id}",
             json=data,
@@ -88,12 +97,63 @@ def get_views_metadata_documents(
             verify=verify_ssl
         )
         response.raise_for_status()
-        json_response = response.json()
 
-        logging.info("Data from database %s returned successfully", database_name)
+        # 2. Try to parse JSON response
+        try:
+            json_response = response.json()
+        except ValueError as e:
+            logging.error(f"Failed to parse JSON response: {str(e)}")
+            raise ValueError(f"Invalid JSON response from server: {response.text}")
 
+        # 3. Validate response structure
+        if not isinstance(json_response, list) and 'viewsDetails' not in json_response:
+            error_msg = f"Unexpected response format from server: {response.text}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+
+        return json_response
+
+    try:
+        # Initial request without pagination to detect DC API version
+        initial_response = make_request(prepare_request_data())
+        logging.info(f"Initial response: {initial_response}")
+        # If it's not a list, it's the old DC API (<9.1.0)
+        if not isinstance(initial_response, list):
+            views = initial_response.get('viewsDetails', initial_response)
+            total_views = len(views)
+            logging.info(f"Total views retrieved: {total_views}")
+        
+            # If we got less than 1000 views we can exit
+            if total_views < 1000:
+                logging.info(f"Retrieved {total_views} views in single request. No pagination needed")
+                all_views = views
+            else:
+                # We're dealing with the new API version - need to paginate
+                logging.info("Dealing with the pagination API. Making requests with pagination.")
+                all_views = views
+                offset = 1000
+                
+                while True:
+                    data = prepare_request_data(offset=offset, limit=1000)
+                    page_response = make_request(data)
+                    logging.info(f"Made request with offset {offset} and limit 1000: {page_response}")
+                    page_views = page_response.get('viewsDetails', page_response)
+                    if not page_views:
+                        break
+                        
+                    all_views.extend(page_views)
+                    offset += 1000
+                    logging.info(f"Retrieved {len(all_views)} views so far")
+                    
+                    if len(page_views) < 1000:
+                        break
+        else:
+            all_views = initial_response
+
+        logging.info(f"Total views retrieved: {len(all_views)}")
+        
         return parse_metadata_json(
-            json_response=json_response,
+            json_response=all_views,
             use_associations=table_associations,
             use_descriptions=table_descriptions,
             use_column_descriptions=table_column_descriptions,

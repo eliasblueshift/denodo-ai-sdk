@@ -56,8 +56,8 @@ class streamAnswerQuestionUsingViewsRequest(BaseModel):
     disclaimer: bool = True
     verbose: bool = True
 
-@router.get('/streamAnswerQuestionUsingViews', response_class = StreamingResponse)
-def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingViewsRequest = Depends(), auth: str = Depends(authenticate)):
+@router.post('/streamAnswerQuestionUsingViews', response_class = StreamingResponse, tags = ['Ask a Question - Streaming - Custom Vector Store'])
+def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
     """
     The only difference between this endpoint and `streamAnswerQuestion` is that this endpoint 
     expects the result of the vector search to be passed in as a parameter.

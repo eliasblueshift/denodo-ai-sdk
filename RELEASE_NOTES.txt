@@ -1,3 +1,32 @@
+version 0.5 - 20250113
+------------------------
+
+## CHANGES
+
+- Fix graph generator bug that caused it to never work
+- Update recommended models for each provider
+- Add platform information to the logs for improved debugging
+
+version 0.5-beta - 20250109
+------------------------
+
+## CHANGES
+
+- Added POST compatibility to answerQuestion, answerDataQuestion, answerMetadataQuestion, streamAnswerQuestion
+- Change GET to POST for answerQuestionUsingViews and streamAnswerQuestionUsingViews
+- Organize endpoints by categories in Swagger docs
+- Add support for Google AI Studio LLM's and embeddings
+- Fixed bug where broken graph image would be shown in the chatbot
+- Improved the start message to show AI SDK version
+- Add support for external Ollama endpoints
+- Add healthcheck endpoint to the AI SDK
+- Fixed SQL generation of reserved words in Denodo
+- Fixed SQL generation fixer agent
+- Fixed instance where smaller LLM's would wrongly not execute the SQL after generating it
+- Added Docker files to main repository
+- Improved chatbot speed
+- Add compatibility with the new pagination architecture in the getMetadata Data Catalog endpoints
+
 version 0.4 -  20241209
 ------------------------
 

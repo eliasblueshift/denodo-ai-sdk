@@ -9,11 +9,12 @@ class UniformLLM:
         "AzureOpenAI",
         "Bedrock",
         "Google",
+        "GoogleAIStudio",
         "Anthropic",
         "NVIDIA",
         "Groq",
         "Ollama",
-        "Mistral"
+        "Mistral",
         ]
     
     def __init__(self, provider_name, model_name, temperature = 0, max_tokens = 2048): 
@@ -30,7 +31,7 @@ class UniformLLM:
 
         if self.provider_name.lower() not in list(map(str.lower, self.VALID_PROVIDERS)):
             logging.warning(f"Provider '{self.provider_name}' not in standard list. Creating custom OpenAI-compatible provider.")
-            logging.info(f"Expected environment variables for custom provider:")
+            logging.info("Expected environment variables for custom provider:")
             logging.info(f"- {self.provider_name.upper()}_API_KEY (required)")
             logging.info(f"- {self.provider_name.upper()}_BASE_URL (required)")
             logging.info(f"- {self.provider_name.upper()}_PROXY (optional)")
@@ -55,11 +56,41 @@ class UniformLLM:
             self.setup_ollama()
         elif self.provider_name.lower() == "mistral":
             self.setup_mistral()
+        elif self.provider_name.lower() == "googleaistudio":
+            self.setup_google_ai_studio()
+
+    def setup_google_ai_studio(self):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        google_ai_studio_api_key = os.getenv('GOOGLE_AI_STUDIO_API_KEY')
+        if google_ai_studio_api_key is None:
+            raise ValueError("GOOGLE_AI_STUDIO_API_KEY environment variable not set.")
+        
+        self.llm = ChatGoogleGenerativeAI(
+            model = self.model_name,
+            api_key = google_ai_studio_api_key,
+            temperature = self.temperature,
+            max_tokens = self.max_tokens)
+        
+        self.callback = TokenCounter(self.llm)
     
     def setup_ollama(self):
         from langchain_ollama.chat_models import ChatOllama
-
-        self.llm = ChatOllama(model = self.model_name, temperature = self.temperature, max_tokens = self.max_tokens)
+        base_url = os.getenv('OLLAMA_API_BASE_URL')
+        if base_url:
+            self.llm = ChatOllama(
+                model = self.model_name,
+                temperature = self.temperature,
+                max_tokens = self.max_tokens,
+                base_url = base_url
+            )
+        else:
+            self.llm = ChatOllama(
+                model = self.model_name,
+                temperature = self.temperature,
+                max_tokens = self.max_tokens
+            )
+            
         self.callback = TokenCounter(self.llm)
 
     def setup_nvidia(self):
@@ -111,7 +142,7 @@ class UniformLLM:
         google_credentials_file = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
         if google_credentials_file is None:
             raise ValueError("GOOGLE_APPLICATION_CREDENTIALS environment variable not set.")
-
+                
         safety_settings={
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
@@ -224,7 +255,6 @@ class UniformLLM:
                 "max_tokens": self.max_tokens
             }
         )
-
         self.callback = TokenCounter(self.llm)
 
     def setup_mistral(self):

@@ -50,7 +50,7 @@ class similaritySearchRequest(BaseModel):
 class similaritySearchResponse(BaseModel):
     views: List[str]
 
-@router.get("/similaritySearch", response_class = JSONResponse, response_model = similaritySearchResponse)
+@router.get("/similaritySearch", response_class = JSONResponse, response_model = similaritySearchResponse, tags = ['Vector Store'])
 def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth: str = Depends(authenticate)):
     """
     This endpoint performs a similarity search on the vector database specified in the request.

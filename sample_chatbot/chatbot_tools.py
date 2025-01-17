@@ -41,7 +41,7 @@ def denodo_query(natural_language_query, api_host, username, password, plot = 0,
     request_params = {
         'question': natural_language_query,
         'mode': 'data',
-        'verbose': True,
+        'verbose': False,
         'plot': bool(plot),
         'plot_details': plot_details
     }

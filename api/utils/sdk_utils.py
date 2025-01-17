@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import logging
 import requests
@@ -66,6 +67,9 @@ def prepare_vql(vql):
     error_log = ''
     error_categories = []
 
+    # Convert VQL to single line for regex processing
+    vql_single_line = vql.replace('\n', ' ')
+
     # Look for LLM code styling
     if '```' in vql:
         logging.info("Backward ticks detected in VQL, fixing...")
@@ -74,6 +78,38 @@ def prepare_vql(vql):
     if '\\_' in vql:
         logging.info("Markdown underscore detected in VQL, fixing...")
         vql = vql.replace('\\_', '_')
+    
+    # Protected words for aliases
+    protected_words = (
+        'ADD|ALL|ALTER|AND|ANY|AS|ASC|BASE|BOTH|CASE|CONNECT|CONTEXT|CREATE|CROSS|'
+        'CURRENT_DATE|CURRENT_TIMESTAMP|CUSTOM|DATABASE|DEFAULT|DESC|DF|DISTINCT|DROP|'
+        'EXISTS|FALSE|FETCH|FLATTEN|FROM|FULL|GRANT|GROUP BY|HASH|HAVING|HTML|IF|INNER|'
+        'INTERSECT|INTO|IS|JDBC|JOIN|LDAP|LEADING|LEFT|LIMIT|LOCALTIME|LOCALTIMESTAMP|'
+        'MERGE|MINUS|MY|NATURAL|NESTED|NOS|NOT|NULL|OBL|ODBC|OF|OFF|OFFSET|ON|ONE|OPT|'
+        'OR|ORDER BY|ORDERED|PRIVILEGES|READ|REVERSEORDER|REVOKE|RIGHT|ROW|SELECT|SWAP|'
+        'TABLE|TO|TRACE|TRAILING|TRUE|UNION|USER|USING|VIEW|WHEN|WHERE|WITH|WRITE|WS|ZERO'
+    )
+    
+    # Pattern to match protected words used as aliases
+    pattern = fr'\s+AS\s+({protected_words})\s+'
+    matches = re.finditer(pattern, vql_single_line, re.IGNORECASE)
+    
+    # Track all replacements
+    replacements = {}
+    for match in matches:
+        protected_word = match.group(1)
+        new_alias = f"{protected_word}_"
+        replacements[protected_word] = new_alias
+        logging.info(f"Protected word '{protected_word}' used as alias, appending underscore")
+        
+    # Apply replacements
+    modified_vql = vql
+    for old_word, new_word in replacements.items():
+        # Pattern to match the exact alias after AS
+        replace_pattern = fr'(\s+AS\s+){old_word}(\s+)'
+        modified_vql = re.sub(replace_pattern, fr'\1{new_word}\2', modified_vql, flags=re.IGNORECASE)
+    
+    vql = modified_vql
     
     # Look for forbidden functions
     forbidden_functions = [
@@ -106,22 +142,20 @@ def prepare_vql(vql):
                 continue
 
     # Look for LIMIT in subquery
-    vql_without_line_breaks = vql.replace("\n", " ")
-    matches = match_nested_parentheses(vql_without_line_breaks)
+    matches = match_nested_parentheses(vql_single_line)
     
     for match in matches:
         if ' LIMIT ' in match:
             error_log += "There is a LIMIT in subquery, which is not permitted in VQL. Use ROW_NUMBER () instead.\n"
             if "LIMIT_SUBQUERY" not in error_categories:
                 error_categories.append('LIMIT_SUBQUERY')
-
         
         if ' FETCH ' in match:
             error_log += "There is a FETCH in subquery, which is not permitted in VQL. Use ROW_NUMBER () instead.\n"
             if "LIMIT_SUBQUERY" not in error_categories:
                 error_categories.append('LIMIT_SUBQUERY')
 
-    if " OFFSET " in vql_without_line_breaks:
+    if " OFFSET " in vql_single_line:
         error_log += "There is a LIMIT OFFSET in the main query, which is not permitted in VQL. Use ROW_NUMBER () instead.\n"
         if "LIMIT_OFFSET" not in error_categories:
             error_categories.append('LIMIT_OFFSET')
@@ -132,25 +166,18 @@ def prepare_vql(vql):
     logging.info(f"prepare_vql vql: {vql} error log: {error_log} and categories: {error_categories}")
     return vql.strip(), error_log, error_categories
 
-def generate_vql_restrictions(filter_params, prompt_parts, vql_restrictions_prompt, groupby_vql_prompt, having_vql_prompt, dates_vql_prompt, arithmetic_vql_prompt, vql_rules_prompt):
+def generate_vql_restrictions(prompt_parts, vql_rules_prompt, groupby_vql_prompt, having_vql_prompt, dates_vql_prompt, arithmetic_vql_prompt):
     if prompt_parts is None:
-        return vql_restrictions_prompt
+        return vql_rules_prompt.replace("{EXTRA_RESTRICTIONS}", "")
 
     vql_prompt_parts = {
-        "groupby": groupby_vql_prompt,
-        "having": having_vql_prompt,
-        "dates": dates_vql_prompt,
-        "arithmetic": arithmetic_vql_prompt
+        "groupby": groupby_vql_prompt if prompt_parts.get("groupby") else "",
+        "having": having_vql_prompt if prompt_parts.get("having") else "",
+        "dates": dates_vql_prompt if prompt_parts.get("dates") else "",
+        "arithmetic": arithmetic_vql_prompt if prompt_parts.get("arithmetic") else ""
     }
 
-    conditions = {
-        "groupby": "<orderby>" in filter_params or "<groupby>" in filter_params,
-        "having": "<having>" in filter_params,
-        "dates": "<dates>" in filter_params,
-        "arithmetic": "<arithmetic>" in filter_params
-    }
-
-    extra_restrictions = '\n'.join(vql_prompt_parts[key] for key, condition in conditions.items() if condition)
+    extra_restrictions = '\n'.join(vql_prompt_parts[key] for key in vql_prompt_parts if prompt_parts.get(key))
     return vql_rules_prompt.replace("{EXTRA_RESTRICTIONS}", extra_restrictions)
 
 def get_response_format(markdown_response):

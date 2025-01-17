@@ -181,6 +181,11 @@ def process_chunk(chunk):
     return chunk.replace("\n", "<NEWLINE>")
 
 def add_to_chat_history(chat_history, human_query, ai_response, tool_name, tool_output, original_xml_call):
+    #Remove related questions from the ai_response
+    related_question_index = ai_response.find("<related_question>")
+    if related_question_index != -1:
+        ai_response = ai_response[:related_question_index].strip()
+
     if tool_name == "database_query":
         execution_result = tool_output.get('execution_result', {})
         if isinstance(execution_result, dict) and len(execution_result.items()) > 15:

@@ -3,6 +3,7 @@ import sys
 import logging
 import uvicorn
 import warnings
+import platform
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -34,7 +35,6 @@ required_vars = [
     "METADATA_CATEGORY",
     "GET_CONCEPTS",
     "GENERATE_VISUALIZATION",
-    "VQL_RESTRICTIONS",
     "GROUPBY_VQL",
     "HAVING_VQL",
     "DATES_VQL",
@@ -83,6 +83,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ai_sdk_params = {
+        "OS": platform.platform(),
         "AI SDK Host": AI_SDK_HOST,
         "AI SDK Port": AI_SDK_PORT,
         "AI SDK Version": AI_SDK_VERSION,
@@ -139,6 +140,14 @@ async def swagger_ui_html():
         swagger_favicon_url = "favicon.ico"
     )
 
+@app.get("/health", tags=["Health Check"])
+async def health_check():
+    """
+    Health check endpoint for container orchestration.
+    Returns status 200 if the service is running.
+    """
+    return {"status": "OK"}
+
 app.include_router(getMetadata.router)
 app.include_router(getConcepts.router)
 app.include_router(similaritySearch.router)
@@ -155,5 +164,5 @@ if __name__ == "__main__":
         host = AI_SDK_HOST,
         port = AI_SDK_PORT,
         ssl_keyfile = AI_SDK_SSL_KEY,
-        ssl_certfile = AI_SDK_SSL_CERT
+        ssl_certfile = AI_SDK_SSL_CERT,
     )

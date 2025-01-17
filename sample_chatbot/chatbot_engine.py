@@ -2,10 +2,15 @@ import inspect
 import traceback
 import logging
 
-from utils.utils import add_langfuse_callback, generate_langfuse_session_id
+from utils.utils import add_langfuse_callback, generate_langfuse_session_id, custom_tag_parser
 from langchain_core.output_parsers import StrOutputParser
 from sample_chatbot.chatbot_utils import process_tool_query, add_to_chat_history, get_relevant_tables, readable_tool_result, parse_xml_tags
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+RELATED_QUESTIONS_PROMPT = """
+After I have answered the user's query, I will also provide a list of 3 related questions in plain text format (no markdown) that the user might ask next.
+The questions should be closely related to the current conversation and should not require external information.
+- Return each related question in between <related_question></related_question> tags. I will now answer:"""
 
 class ChatbotEngine:
     def __init__(self, llm, system_prompt, tool_selection_prompt, tools, api_host, username, password, vdp_database_names, vector_store_provider, message_history = 4):
@@ -32,7 +37,7 @@ class ChatbotEngine:
         self.answer_with_tool_prompt = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
             MessagesPlaceholder("chat_history", n_messages = self.message_history),
-            ("human", "{input}" + "\n{tool_query}"),
+            ("human", "{input}" + "\n{tool_query}\n" + RELATED_QUESTIONS_PROMPT),
         ])
 
         self.tool_selection_chain = (
@@ -108,7 +113,7 @@ class ChatbotEngine:
                     "input": query,
                     "chat_history": self.chat_history,
                     "tool_query": readable_tool_output,
-                    "denodo_tables": denodo_tables
+                    "denodo_tables": denodo_tables,
                 },
                 config = {
                     "callbacks": add_langfuse_callback(self.llm_callback, self.llm_model, self.session_id),
@@ -119,15 +124,36 @@ class ChatbotEngine:
                 tool_name, tool_output, original_xml_call = "Direct Response", "", ""
             
             ai_response = ""
+            buffer = ""
+            streaming_buffer = True
+            
             for chunk in ai_stream:
                 ai_response += chunk
-                yield chunk
+                
+                if streaming_buffer and '<' in chunk:
+                    streaming_buffer = False
+                    buffer = chunk
+                elif streaming_buffer:
+                    yield chunk
+                else:
+                    buffer += chunk
 
+            pre_buffer = buffer.split('<', 1)
+            yield pre_buffer[0]
+
+            if len(pre_buffer) > 1:
+                buffer = '<' + pre_buffer[1]
+                # Parse related questions from the final buffer if it contains any
+                if '<related_question>' in buffer:
+                    related_questions = custom_tag_parser(buffer, 'related_question')
+            else:
+                related_questions = []
+    
             return_data = {
                 "vql": None,
                 "data_sources": self.llm_model,
                 "embeddings": None,
-                "related_questions": None,
+                "related_questions": related_questions,
                 "execution_result": None,
                 "total_tokens": 0,
                 "answer": ai_response
@@ -136,7 +162,6 @@ class ChatbotEngine:
             if tool_name == "database_query" and isinstance(tool_output, dict):
                 return_data["vql"] = tool_output["sql_query"]
                 return_data["execution_result"] = tool_output["execution_result"]
-                return_data["related_questions"] = tool_output["related_questions"]
                 return_data["graph"] = tool_output["raw_graph"]
                 return_data["tables_used"] = tool_output["tables_used"]
                 return_data["query_explanation"] = tool_output["query_explanation"]

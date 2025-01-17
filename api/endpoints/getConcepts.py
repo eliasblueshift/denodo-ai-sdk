@@ -41,7 +41,7 @@ class getConceptsRequest(BaseModel):
     embeddings_provider: str = os.getenv('EMBEDDINGS_PROVIDER')
     embeddings_model: str = os.getenv('EMBEDDINGS_MODEL')
 
-@router.get("/getConcepts", response_class = JSONResponse, response_model = Dict[str, List[int]])
+@router.get("/getConcepts", response_class = JSONResponse, response_model = Dict[str, List[int]], tags = ['Deprecated'])
 def getConcepts(endpoint_request: getConceptsRequest = Depends(), auth: str = Depends(authenticate)):
     """
     This endpoint extracts the concepts from a question and returns the embeddings for each concept.

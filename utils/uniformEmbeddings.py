@@ -11,7 +11,8 @@ class UniformEmbeddings:
         "Google",
         "Ollama",
         "Mistral",
-        "NVIDIA"
+        "NVIDIA",
+        "GoogleAIStudio"
     ]
 
     def __init__(self, provider_name, model_name):
@@ -24,7 +25,7 @@ class UniformEmbeddings:
 
         if self.provider_name.lower() not in list(map(str.lower, self.VALID_PROVIDERS)):
             logging.warning(f"Provider '{self.provider_name}' not in standard list. Creating custom OpenAI-compatible provider.")
-            logging.info(f"Expected environment variables for custom provider:")
+            logging.info("Expected environment variables for custom provider:")
             logging.info(f"- {self.provider_name.upper()}_API_KEY (required)")
             logging.info(f"- {self.provider_name.upper()}_BASE_URL (required)")
             logging.info(f"- {self.provider_name.upper()}_PROXY (optional)")
@@ -45,11 +46,30 @@ class UniformEmbeddings:
             self.setup_mistral()
         elif self.provider_name.lower() == "nvidia":
             self.setup_nvidia()
+        elif self.provider_name.lower() == "googleaistudio":
+            self.setup_google_ai_studio()
+
+    def setup_google_ai_studio(self):
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        api_key = os.getenv('GOOGLE_AI_STUDIO_API_KEY')
+        if api_key is None:
+            raise ValueError("GOOGLE_AI_STUDIO_API_KEY environment variable not set.")
+        
+        self.model = GoogleGenerativeAIEmbeddings(
+            model=self.model_name,
+            google_api_key=api_key
+        )
+
     
     def setup_ollama(self):
         from langchain_community.embeddings import OllamaEmbeddings
-
-        self.model = OllamaEmbeddings(model = self.model_name)
+        base_url = os.getenv('OLLAMA_API_BASE_URL')
+        
+        if base_url:
+            self.model = OllamaEmbeddings(model = self.model_name, base_url = base_url)
+        else:
+            self.model = OllamaEmbeddings(model = self.model_name)
 
     def setup_nvidia(self):
         from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings

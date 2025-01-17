@@ -72,10 +72,12 @@ class answerMetadataQuestionResponse(BaseModel):
     llm_time: float
     total_execution_time: float
 
-@router.get('/answerMetadataQuestion', response_class = JSONResponse, response_model = answerMetadataQuestionResponse)
-def answerMetadataQuestion(endpoint_request: answerMetadataQuestionRequest = Depends(), auth: str = Depends(authenticate)):
-    """
-    This endpoint processes a natural language question and tries to answer it using the metadata in Denodo.
+@router.get('/answerMetadataQuestion', response_class = JSONResponse, response_model = answerMetadataQuestionResponse, tags = ['Ask a Question'])
+def answer_metadata_question_get(
+    request: answerMetadataQuestionRequest = Depends(),
+    auth: str = Depends(authenticate)
+):
+    '''This endpoint processes a natural language question and tries to answer it using the metadata in Denodo.
     It will do this by:
 
     - Searching for the relevant tables' schema using vector search
@@ -93,33 +95,62 @@ def answerMetadataQuestion(endpoint_request: answerMetadataQuestionRequest = Dep
     - VDB_NAMES
 
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
-    is a complex task that should be handled with a powerful LLM."""
+    is a complex task that should be handled with a powerful LLM.'''
+    return process_metadata_question(request, auth)
 
+@router.post('/answerMetadataQuestion', response_class = JSONResponse, response_model = answerMetadataQuestionResponse, tags = ['Ask a Question'])
+def answer_metadata_question_post(
+    endpoint_request: answerMetadataQuestionRequest,
+    auth: str = Depends(authenticate)
+):
+    '''This endpoint processes a natural language question and tries to answer it using the metadata in Denodo.
+    It will do this by:
+
+    - Searching for the relevant tables' schema using vector search
+    - Generating an answer to the question using the metadata
+
+    This endpoint will also automatically look for the the following values in the environment variables for convenience:
+
+    - EMBEDDINGS_PROVIDER
+    - EMBEDDINGS_MODEL
+    - VECTOR_STORE
+    - SQL_GENERATION_PROVIDER
+    - SQL_GENERATION_MODEL
+    - CHAT_PROVIDER
+    - CHAT_MODEL
+    - VDB_NAMES
+
+    As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
+    is a complex task that should be handled with a powerful LLM.'''
+    return process_metadata_question(endpoint_request, auth)
+
+def process_metadata_question(request_data: answerMetadataQuestionRequest, auth: str):
+    """Main function to process the metadata question and return the answer"""
     try:
         # Right now, not all Denodo instances have permissions implemented. This should be deleted in the future.
         USER_PERMISSIONS = int(os.getenv("USER_PERMISSIONS", 0))
 
         vector_search_tables, timings = sdk_ai_tools.get_relevant_tables(
-            query=endpoint_request.question,
-            embeddings_provider=endpoint_request.embeddings_provider,
-            embeddings_model=endpoint_request.embeddings_model,
-            vector_store_provider=endpoint_request.vector_store_provider,
-            vdb_list=endpoint_request.vdp_database_names,
+            query=request_data.question,
+            embeddings_provider=request_data.embeddings_provider,
+            embeddings_model=request_data.embeddings_model,
+            vector_store_provider=request_data.vector_store_provider,
+            vdb_list=request_data.vdp_database_names,
             auth=auth,
-            k=endpoint_request.vector_search_k,
+            k=request_data.vector_search_k,
             user_permissions=USER_PERMISSIONS,
-            use_views=endpoint_request.use_views,
-            expand_set_views=endpoint_request.expand_set_views
+            use_views=request_data.use_views,
+            expand_set_views=request_data.expand_set_views
         )
 
         with timing_context("llm_time", timings):
             category, category_response, category_related_questions, sql_category_tokens = sdk_ai_tools.sql_category(
-                query=endpoint_request.question, 
+                query=request_data.question, 
                 vector_search_tables=vector_search_tables, 
-                llm_provider=endpoint_request.chat_provider,
-                llm_model=endpoint_request.chat_model,
+                llm_provider=request_data.chat_provider,
+                llm_model=request_data.chat_model,
                 mode="metadata",
-                custom_instructions=endpoint_request.custom_instructions
+                custom_instructions=request_data.custom_instructions
             )
 
         response = sdk_answer_question.process_metadata_category(
@@ -127,7 +158,7 @@ def answerMetadataQuestion(endpoint_request: answerMetadataQuestionRequest = Dep
             category_related_questions=category_related_questions, 
             vector_search_tables=vector_search_tables, 
             timings=timings,
-            disclaimer=endpoint_request.disclaimer,
+            disclaimer=request_data.disclaimer,
         )
 
         return JSONResponse(content=jsonable_encoder(response), media_type='application/json')

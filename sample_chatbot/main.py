@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import hashlib
 import requests
 import logging
 import warnings
@@ -104,6 +105,7 @@ else:
 app = Flask(__name__, static_folder = 'frontend/build')
 app.config['UPLOAD_FOLDER'] = "uploads"
 app.secret_key = os.urandom(24)
+app.session_interface.digest_method = staticmethod(hashlib.sha256)
 auth = HTTPBasicAuth()
 
 # Flask-Login setup

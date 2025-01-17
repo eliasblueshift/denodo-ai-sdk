@@ -18,7 +18,7 @@ The goals of this project are:
 | Provider    | LLM Recommended      | LLM Alternative                     | Embeddings            |
 |------------:|---------------------:|------------------------------------:|----------------------:|
 | OpenAI      | gpt-4o               | gpt-4o-mini                         | text-embedding-3-large|
-| Bedrock     | anthropic.claude-3-5-sonnet-20240620-v1:0    | anthropic.claude-3-haiku-20240307-v1:0                   | titan-embed-text-v2   |
+| Bedrock     | anthropic.claude-3-5-sonnet-20240620-v1:0    | anthropic.claude-3-haiku-20240307-v1:0                   | amazon.titan-embed-text-v2:0   |
 | Google      | gemini-1.5-pro       | gemini-1.5-flash                    | gecko                 |
 | Mistral      | mistral-large-latest       | mistral-large-latest                    | mistral-embed                 |
 

@@ -97,14 +97,12 @@ def query_to_vql(query, vector_search_tables, llm_provider, llm_model, vector_st
     }
 
     vql_restrictions = sdk_utils.generate_vql_restrictions(
-        filter_params,
         prompt_parts,
         VQL_RULES_PROMPT,
         GROUPBY_VQL_PROMPT,
         HAVING_VQL_PROMPT,
         DATES_VQL_PROMPT,
         ARITHMETIC_VQL_PROMPT,
-        VQL_RULES_PROMPT
     )
 
     response = chain.invoke(
@@ -318,30 +316,25 @@ def graph_generator(query, data_file, execution_result, llm_provider, llm_model,
     python_repl = PythonREPL()
     output = python_repl.run(python_code)
 
-    # Check if data:image/svg+xml;base64, at the beginning of the output
-    if output.startswith("data:image/svg+xml;base64,"):
-        graph_image = output
-    else:
-        graph_image = "data:image/svg+xml;base64," + output
-
     # Check if the \n at the end of the string and remove it
-    if graph_image.endswith("\n"):
-        graph_image = graph_image[:-1]
+    if output.endswith("\n"):
+        output = output[:-1]
 
-    return graph_image, llm.tokens
+    return output, llm.tokens
 
 @utils.log_params
 @utils.timed
-def query_fixer(query, llm_provider, llm_model, error_log=False):
+def query_fixer(query, llm_provider, llm_model, error_log=False, error_categories=[]):
     llm = UniformLLM(llm_provider, llm_model)
     
-    vql_query, error_log, error_categories = sdk_utils.prepare_vql(query)
+    if not error_log:
+        query, error_log, error_categories = sdk_utils.prepare_vql(query)
 
-    prompt, parameters = _get_prompt_and_parameters(vql_query, error_log, error_categories)
+    prompt, parameters = _get_prompt_and_parameters(query, error_log, error_categories)
     
     if not prompt:
         logging.info("VQL query is valid, continuing execution.")
-        return vql_query, llm.tokens
+        return query, llm.tokens
 
     final_prompt = PromptTemplate.from_template(prompt)
     final_chain = final_prompt | llm.llm | StrOutputParser()
@@ -354,7 +347,7 @@ def query_fixer(query, llm_provider, llm_model, error_log=False):
         }
     )
     
-    fixed_vql_query = sdk_utils.prepare_vql(utils.custom_tag_parser(response, 'vql', default='')[0].strip())
+    fixed_vql_query, error_log, error_categories = sdk_utils.prepare_vql(utils.custom_tag_parser(response, 'vql', default='')[0].strip())
     return fixed_vql_query, llm.tokens
 
 def _get_prompt_and_parameters(vql_query, error_log, error_categories):
@@ -370,10 +363,18 @@ def _get_prompt_and_parameters(vql_query, error_log, error_categories):
 
     if error_log:
         logging.info("VQL generation failed, fixing query.")
+        vql_restrictions = sdk_utils.generate_vql_restrictions(
+            prompt_parts={"dates": 1, "arithmetic": 1, "groupby": 1, "having": 1},
+            vql_rules_prompt=VQL_RULES_PROMPT,
+            groupby_vql_prompt=GROUPBY_VQL_PROMPT,
+            having_vql_prompt=HAVING_VQL_PROMPT,
+            dates_vql_prompt=DATES_VQL_PROMPT,
+            arithmetic_vql_prompt=ARITHMETIC_VQL_PROMPT,
+        )
         return QUERY_FIXER_PROMPT, {
             "query": vql_query,
             "query_error": error_log,
-            "vql_restrictions": VQL_RESTRICTIONS_PROMPT
+            "vql_restrictions": vql_restrictions
         }
 
     return None, None

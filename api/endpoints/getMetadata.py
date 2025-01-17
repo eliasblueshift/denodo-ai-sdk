@@ -87,7 +87,7 @@ class getMetadataResponse(BaseModel):
     db_schema_json: Dict
     db_schema_text: List[TableSummary]
 
-@router.get("/getMetadata", response_class = JSONResponse, response_model = getMetadataResponse)
+@router.get("/getMetadata", response_class = JSONResponse, response_model = getMetadataResponse, tags = ['Vector Store'])
 def getMetadata(endpoint_request: getMetadataRequest = Depends(), auth: str = Depends(authenticate)):
     """
     This endpoint retrieves the metadata from a list of VDP databases (separated by commas) and returns it in JSON and natural language format. 
