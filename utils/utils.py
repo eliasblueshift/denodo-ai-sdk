@@ -16,6 +16,7 @@ import json
 import logging
 import tiktoken
 import functools
+import asyncio
 
 from time import time
 from uuid import uuid4
@@ -29,7 +30,32 @@ from langchain.callbacks.base import BaseCallbackHandler
 
 def log_params(func):
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    async def async_wrapper(*args, **kwargs):
+        func_name = func.__name__
+        
+        # Log entry
+        def format_param(key, value):
+            if key == "auth":
+                return f"{key}=<redacted>"
+            str_value = str(value)
+            return f"{key}={str_value[:500] + '...' if len(str_value) > 500 else str_value}"
+        
+        params = ", ".join([format_param(f"arg{i}", arg) for i, arg in enumerate(args)] +
+                           [format_param(k, v) for k, v in kwargs.items()])
+        logging.info(f"{func_name} - Entry: Parameters({params})")
+        
+        # Call the original function
+        result = await func(*args, **kwargs)
+        
+        # Log exit
+        str_result = str(result)
+        truncated_result = str_result[:500] + '...' if len(str_result) > 500 else str_result
+        logging.info(f"{func_name} - Exit: Returned({truncated_result})")
+        
+        return result
+    
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
         func_name = func.__name__
         
         # Log entry
@@ -52,7 +78,12 @@ def log_params(func):
         logging.info(f"{func_name} - Exit: Returned({truncated_result})")
         
         return result
-    return wrapper
+    
+    # Check if the function is a coroutine function
+    if asyncio.iscoroutinefunction(func):
+        return async_wrapper
+    else:
+        return sync_wrapper
 
 @lru_cache(maxsize=None)
 def get_langfuse_callback(model_id, session_id = None):
@@ -100,7 +131,22 @@ def timed(func):
         wrapper.elapsed_time = elapsed_time
         return result
 
-    return wrapper
+    @wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        start = time()
+        result = await func(*args, **kwargs)
+        end = time()
+        elapsed_time = round(end - start, 2)
+        logging.info("{} ran in {}s".format(func.__name__, elapsed_time))
+
+        async_wrapper.elapsed_time = elapsed_time
+        return result
+
+    # Check if the function is a coroutine function
+    if asyncio.iscoroutinefunction(func):
+        return async_wrapper
+    else:
+        return wrapper
 
 # Get the associations for a given table
 def get_table_associations(table_name, table_json):
@@ -117,9 +163,10 @@ def schema_summary(schema):
     summary = "====="
     table_name = schema['tableName']
     if "description" in schema and schema['description'] and schema['description'].strip():
-        summary += f"Table {table_name}=====\nDescription: {schema['description']}\nColumns:\n"
+        table_description = schema['description'].replace("\n", " ").strip()
+        summary += f"Table {table_name}=====\nDescription: {table_description}\nColumns:\n"
     else:
-        summary += f"Table {table_name}=====\n"
+        summary += f"Table {table_name}=====\nColumns:\n"
     for column_info in schema['schema']:
         column_name = column_info['columnName']
         column_type = column_info['type']
@@ -128,7 +175,7 @@ def schema_summary(schema):
         else:
             column_logical_name = None
         if "description" in column_info:
-            column_description = column_info['description']
+            column_description = column_info['description'].replace("\n", " ").strip()
         else:
             column_description = None
 
@@ -184,26 +231,96 @@ def custom_tag_parser(text, tag, default=[]):
     
     return matches
 
-@timed
-def prepare_schema(schema, user_permissions=False, start_index = 0):
-    if not schema:
-        raise ValueError("No schema was received in prepare_schema for VectorDB insertion.")
+def flatten_list(list_of_lists):
+    flattened_list = [x for item in list_of_lists for x in (item if isinstance(item, list) else [item])]
+    return flattened_list
 
-    def create_document(table, index):
+def create_chunks(table):
+    """
+    This function takes a string (schema_summary) and keeps everything before the line with Columns:
+    Everything before that is the header and will be kept in every chunk.
+    After Columns: you get every line and distribute it evenly so that all chunks have similar token counts.
+    Function returns a list of Documents
+    """
+    # Split into header and content
+    summary = schema_summary(table)
+    parts = summary.split("Columns:\n", 1)
+    header = parts[0] + "Columns:\n"
+    content = parts[1] if len(parts) > 1 else ""
+
+    # Split content into individual column lines and associations
+    lines = content.split("\n")
+    column_lines = []
+    association_lines = []
+    
+    # Separate column lines from association information
+    for line in lines:
+        if line.startswith("This table is also associated"):
+            association_lines.append(line)
+        elif line.strip():  # Only add non-empty lines
+            column_lines.append(line)
+
+    # Association footer that will be added to all chunks
+    association_footer = "\n" + "\n".join(association_lines) if association_lines else ""
+
+    # Calculate optimal chunk size based on 8000 token limit
+    # Account for header and association footer in token calculation
+    base_content = header + association_footer
+    base_tokens = calculate_tokens(base_content)
+    available_tokens = 7500 - base_tokens
+    
+    column_content = "\n".join(column_lines)
+    total_tokens = calculate_tokens(column_content)
+    target_chunks = (total_tokens // available_tokens) + 1
+    chunk_size = max(1, len(column_lines) // target_chunks)
+        
+    chunks = []
+    base_id = str(table['id'])
+    
+    for i in range(0, len(column_lines), chunk_size):
+        current_lines = column_lines[i:i + chunk_size]
+        chunk_content = header + "\n".join(current_lines) + association_footer + "\n"
+        
+        # Create metadata for the chunk
         base_metadata = {
             "view_name": table['tableName'],
             "view_json": json.dumps(table),
-            "view_id": str(table['id']) if user_permissions else str(index),
+            "view_id": base_id,  # Same ID for all chunks of the same table
             "database_name": table['tableName'].split('.')[0]
+        }
+        
+        chunks.append(Document(
+            id=f"{base_id}_{len(chunks)}",  # Unique ID for each chunk
+            page_content=chunk_content,
+            metadata=base_metadata
+        ))
+
+    return chunks
+
+@timed
+def prepare_schema(schema, embeddings_token_limit = 0):
+
+    def create_document(table, embeddings_token_limit):            
+        table_summary = schema_summary(table)
+        table_summary_tokens = calculate_tokens(table_summary)
+        if embeddings_token_limit and table_summary_tokens > embeddings_token_limit:
+            return create_chunks(table)
+
+        base_metadata = {
+            "view_name": table['tableName'],
+            "view_json": json.dumps(table),
+            "view_id": str(table['id']),
+            "database_name": table['tableName'].split('.')[0],
+            "tag_names": str([tag['name'] for tag in table.get('tagDetails', [])])
         }
 
         return Document(
-            id=str(table['id']) if user_permissions else str(index),
+            id=str(table['id']),
             page_content=schema_summary(table),
             metadata=base_metadata
         )
         
-    return [create_document(table, i + start_index) for i, table in enumerate(schema['databaseTables'])]
+    return [create_document(table, embeddings_token_limit) for table in schema['databaseTables']]
 
 class RefreshableBotoSession:
     def __init__(
@@ -279,23 +396,20 @@ class RefreshableBotoSession:
 # Token Counter for LLMs
 class TokenCounter(BaseCallbackHandler):
     def __init__(self, llm):
-        self.llm = llm
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
+        self.llm = llm.llm
+        self.tokens = llm.tokens
 
     def on_llm_start(self, serialized, prompts, **kwargs):
         for p in prompts:
-            self.prompt_tokens += self.llm.get_num_tokens(p)
+            self.tokens['input_tokens'] += self.llm.get_num_tokens(p)
 
     def on_llm_end(self, response, **kwargs):
         results = response.flatten()
         for r in results:
-            self.completion_tokens = self.llm.get_num_tokens(r.generations[0][0].text)
+            self.tokens['output_tokens'] = self.llm.get_num_tokens(r.generations[0][0].text)
+        self.tokens['total_tokens'] = self.tokens['input_tokens'] + self.tokens['output_tokens']
 
     def reset_tokens(self):
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-    
-    @property
-    def total_tokens(self):
-        return self.prompt_tokens + self.completion_tokens
+        self.tokens['input_tokens'] = 0
+        self.tokens['output_tokens'] = 0
+        self.tokens['total_tokens'] = 0

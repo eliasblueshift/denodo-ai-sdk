@@ -23,7 +23,7 @@ USER denodo
 
 COPY  --chown=denodo:denodo . .
 COPY --chown=denodo:denodo --chmod=544 ./entrypoint.sh ./entrypoint.sh
-RUN pip install --no-cache-dir --no-warn-script-location -r requirements_linux.txt
+RUN pip install --no-cache-dir --no-warn-script-location -r requirements.txt
 
 LABEL org.opencontainers.image.vendor="Denodo Technologies" \
     org.opencontainers.image.authors="Denodo Technologies <support@denodo.com>" \

@@ -15,7 +15,6 @@ from api.utils import sdk_config_loader
 from api.utils.sdk_utils import check_env_variables, test_data_catalog_connection
 from api.endpoints import (
     getMetadata,
-    getConcepts,
     similaritySearch,
     streamAnswerQuestion,
     streamAnswerQuestionUsingViews,
@@ -33,7 +32,6 @@ required_vars = [
     "ANSWER_VIEW",
     "SQL_CATEGORY",
     "METADATA_CATEGORY",
-    "GET_CONCEPTS",
     "GENERATE_VISUALIZATION",
     "GROUPBY_VQL",
     "HAVING_VQL",
@@ -42,7 +40,9 @@ required_vars = [
     "VQL_RULES",
     "FIX_LIMIT",
     "FIX_OFFSET",
-    "QUERY_FIXER"
+    "QUERY_FIXER",
+    "QUERY_REVIEWER",
+    "RELATED_QUESTIONS"
 ]
 
 # Ignore warnings
@@ -74,8 +74,6 @@ AI_SDK_VECTOR_STORE_PROVIDER = os.getenv("VECTOR_STORE")
 AI_SDK_VDB_NAMES = [db.strip() for db in os.getenv("VDB_NAMES", "").split(",")]
 AI_SDK_DATA_CATALOG_URL = os.getenv("DATA_CATALOG_URL")
 AI_SDK_DATA_CATALOG_VERIFY_SSL = bool(int(os.getenv("DATA_CATALOG_VERIFY_SSL", 0)))
-AI_SDK_DATA_CATALOG_AUTH_TYPE = os.getenv("DATA_CATALOG_AUTH_TYPE", "http_basic")
-AI_SDK_USER_PERMISSIONS = bool(int(os.getenv("USER_PERMISSIONS", 0)))
 
 # Set this for the tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -99,7 +97,6 @@ async def lifespan(app: FastAPI):
         "Data Catalog URL": AI_SDK_DATA_CATALOG_URL,
         "Data Catalog Connection": test_data_catalog_connection(AI_SDK_DATA_CATALOG_URL, AI_SDK_DATA_CATALOG_VERIFY_SSL),
         "Data Catalog Verify SSL": AI_SDK_DATA_CATALOG_VERIFY_SSL,
-        "Using user permissions": AI_SDK_USER_PERMISSIONS
     }
 
     logging.info("AI SDK parameters:")
@@ -107,17 +104,26 @@ async def lifespan(app: FastAPI):
         logging.info(f"    - {key}: {value}")
 
     if not ai_sdk_params["Data Catalog Connection"]:
-        logging.error("Data Catalog connection failed. Exiting...")
-        exit(1)
+        logging.warning("Could not establish connection to Data Catalog. Please check your configuration.")
 
     yield
+
+tags = [
+    {"name": "Health Check"},
+    {"name": "Vector Store"},
+    {"name": "Ask a Question"},
+    {"name": "Ask a Question - Streaming"},
+    {"name": "Ask a Question - Custom Vector Store"},
+    {"name": "Ask a Question - Streaming - Custom Vector Store"},
+]
 
 app = FastAPI(
     title = 'Denodo AI SDK',
     summary = 'Be fearless.',
     version = AI_SDK_VERSION,
     lifespan = lifespan,
-    docs_url = None
+    docs_url = None,
+    openapi_tags = tags
     )
 
 app.add_middleware(
@@ -149,7 +155,6 @@ async def health_check():
     return {"status": "OK"}
 
 app.include_router(getMetadata.router)
-app.include_router(getConcepts.router)
 app.include_router(similaritySearch.router)
 app.include_router(streamAnswerQuestion.router)
 app.include_router(streamAnswerQuestionUsingViews.router)

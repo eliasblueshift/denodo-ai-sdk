@@ -1,10 +1,11 @@
 import os
+import re
 import json
 import logging
 import inspect
+import asyncio
 
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.prompts import PromptTemplate
 from langchain_experimental.utilities import PythonREPL
@@ -12,7 +13,6 @@ from langchain_core.output_parsers import StrOutputParser
 
 from utils import utils
 from utils.uniformVectorStore import UniformVectorStore
-from utils.uniformEmbeddings import UniformEmbeddings
 from utils.uniformLLM import UniformLLM
 from utils.data_catalog import get_allowed_view_ids
 from api.utils import sdk_utils
@@ -22,10 +22,10 @@ QUERY_TO_VQL_PROMPT = os.getenv("QUERY_TO_VQL")
 ANSWER_VIEW_PROMPT = os.getenv("ANSWER_VIEW")
 SQL_CATEGORY_PROMPT = os.getenv("SQL_CATEGORY")
 METADATA_CATEGORY_PROMPT = os.getenv("METADATA_CATEGORY")
-GET_CONCEPTS_PROMPT = os.getenv("GET_CONCEPTS")
 GENERATE_VISUALIZATION_PROMPT = os.getenv("GENERATE_VISUALIZATION")
 DIRECT_SQL_CATEGORY_PROMPT = os.getenv("DIRECT_SQL_CATEGORY")
 DIRECT_METADATA_CATEGORY_PROMPT = os.getenv("DIRECT_METADATA_CATEGORY")
+RELATED_QUESTIONS_PROMPT = os.getenv("RELATED_QUESTIONS")
 
 # OTHER PROMPTS
 VQL_RESTRICTIONS_PROMPT = os.getenv("VQL_RESTRICTIONS")
@@ -37,12 +37,13 @@ VQL_RULES_PROMPT = os.getenv("VQL_RULES")
 FIX_LIMIT_PROMPT = os.getenv("FIX_LIMIT")
 FIX_OFFSET_PROMPT = os.getenv("FIX_OFFSET")
 QUERY_FIXER_PROMPT = os.getenv("QUERY_FIXER")
+QUERY_REVIEWER_PROMPT = os.getenv("QUERY_REVIEWER")
 
 TODAYS_DATE = datetime.now().strftime("%Y-%m-%d")
 
 @utils.log_params
 @utils.timed
-def generate_view_answer(query, vql_query, vql_execution_result, llm_provider, llm_model, vector_search_tables, markdown_response = False, custom_instructions = '', stream = False):
+async def generate_view_answer(query, vql_query, vql_execution_result, llm_provider, llm_model, vector_search_tables, markdown_response = False, custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
     prompt = PromptTemplate.from_template(ANSWER_VIEW_PROMPT)
     chain = prompt | llm.llm | StrOutputParser()
@@ -58,36 +59,25 @@ def generate_view_answer(query, vql_query, vql_execution_result, llm_provider, l
         "custom_instructions": custom_instructions
     }
     chain_config = {
-        "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+        "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
         "run_name": inspect.currentframe().f_code.co_name,
     }
-
-    if stream:
-        return chain.stream(chain_params, config=chain_config)
         
-    response = chain.invoke(chain_params, config=chain_config)
-    
-    related_questions = utils.custom_tag_parser(response, 'related_question', default = [])
+    response = await chain.ainvoke(chain_params, config=chain_config)
+    response = utils.custom_tag_parser(response, 'final_answer', default = 'There was an error while generating the answer. Please try again later.')[0].strip()
 
-    for q in related_questions:
-        response = response.replace(f"<related_question>{q}</related_question>", "")
-
-    return response, related_questions, llm.tokens
+    return response, llm.tokens
     
 @utils.log_params
 @utils.timed
-def query_to_vql(query, vector_search_tables, llm_provider, llm_model, vector_store_provider, embeddings_provider, embeddings_model, filter_params = '', custom_instructions = ''):
+def query_to_vql(query, vector_search_tables, llm_provider, llm_model, filter_params = '', custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
-    vector_store = UniformVectorStore(
-        provider = vector_store_provider,
-        embeddings_provider = embeddings_provider,
-        embeddings_model = embeddings_model,
-    )
     prompt = PromptTemplate.from_template(QUERY_TO_VQL_PROMPT)
+    query = re.sub(r'(?i)sql', 'VQL', query)
     chain = prompt | llm.llm | StrOutputParser()
 
     filtered_tables = utils.custom_tag_parser(filter_params, 'table', default = [])
-    relevant_tables = get_relevant_tables_json(vector_search_tables, filtered_tables, vector_store)
+    relevant_tables = format_schema_text(vector_search_tables, filtered_tables)
 
     prompt_parts = {
         "having": int("<having>" in filter_params),
@@ -114,19 +104,118 @@ def query_to_vql(query, vector_search_tables, llm_provider, llm_model, vector_st
             "custom_instructions": custom_instructions
         },
         config={
-            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
             "run_name": inspect.currentframe().f_code.co_name,
         }
     )
-    
-    vql_query = utils.custom_tag_parser(response, 'vql', default='')[0].strip()    
-    execute = bool(int(utils.custom_tag_parser(response, 'execute', default = '1')[0].strip()))
+
+    if '```' in response:
+        response = response.replace('```vql', '<vql>').replace('```', '</vql>').strip()
+
+    vql_query = utils.custom_tag_parser(response, 'vql', default='')[0].strip()
     query_explanation = utils.custom_tag_parser(response, 'thoughts', default='')[0].strip()
 
-    return vql_query, execute, query_explanation, llm.tokens
+    return vql_query, query_explanation, llm.tokens
 
 @utils.log_params
-def get_relevant_tables_json(vector_search_tables, filtered_tables, vector_store):
+@utils.timed
+async def related_questions(question, sql_query, execution_result, vector_search_tables, llm_provider, llm_model, custom_instructions = '', session_id = None):
+    llm = UniformLLM(llm_provider, llm_model)
+    prompt = PromptTemplate.from_template(RELATED_QUESTIONS_PROMPT)
+    chain = prompt | llm.llm | StrOutputParser()
+
+    schema = [table for table in vector_search_tables if table['view_name'] in sql_query.replace('"', '')]
+    relevant_tables = format_schema_text(schema, [])
+
+    response = await chain.ainvoke(
+        {
+            "custom_instructions": f"Here are some things to remember:\n{custom_instructions}" if custom_instructions else '',
+            "schema": relevant_tables,
+            "question": question,
+            "sql_response": execution_result,
+        },
+        config={
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
+            "run_name": inspect.currentframe().f_code.co_name,
+        }
+    )
+
+    related_questions = utils.custom_tag_parser(response, 'related_question', default='')
+
+    return related_questions, llm.tokens
+
+def format_schema_text(vector_search_tables, filtered_tables):
+    """
+    Formats and optimizes schema data into a readable text format with reduced token usage for LLMs.
+    """
+    def format_column(col):
+        name = col.get('columnName', 'unnamed')
+        col_type = col.get('type', 'unknown')
+        desc = col.get('description')
+        primary_key = col.get('primaryKey', False)
+        nullable = col.get('nullable', True)
+        examples = col.get('sample_data', [])
+
+        flags = []
+        if primary_key:
+            flags.append("PK")
+        if not nullable:
+            flags.append("NOT NULL")
+
+        parts = [f"  {name} ({col_type})"]
+        if flags:
+            parts.append(f"[{' '.join(flags)}]")
+        if desc:
+            parts.append(f"- {desc if desc.endswith('.') else desc + '.'}")
+        if examples and len(examples) > 0:
+            parts.append(f"sample values: {', '.join(examples)}")
+
+        return " ".join(parts)
+
+    def format_table(table):
+        lines = []
+        table_name = table.get('tableName', 'unnamed_database.unnamed_table')
+        database_name, view_name = table_name.split('.')
+        table_name = f'"{database_name}"."{view_name}"'
+        lines.append(f"# {table_name}")
+
+        # Format columns
+        schema = table.get('schema', [])
+        for col in schema:
+            lines.append(format_column(col))
+
+        # Format associations
+        associations = table.get('associations', [])
+        if associations:
+            lines.append("\n  → Joins:")
+            for assoc in associations:
+                where_clause = assoc.get('where')
+                if where_clause:
+                    lines.append(f"    {where_clause}")
+
+        return "\n".join(lines)
+
+    formatted_tables = []
+    # Create a lookup dictionary for faster access
+    table_lookup = {t['view_name']: t['view_json'] for t in vector_search_tables}
+    if not filtered_tables:
+        return "\n\n".join([format_table(table_lookup[table['view_name']]) for table in vector_search_tables])
+
+    for filtered_table in filtered_tables:
+        if filtered_table not in table_lookup:
+            continue
+
+        table_json = table_lookup[filtered_table].copy()
+        formatted_table = format_table(table_json)
+        formatted_tables.append(formatted_table)
+
+    if formatted_tables:
+        return "\n\n".join(formatted_tables)
+    else:
+        return "\n\n".join([format_table(table_lookup[table['view_name']]) for table in vector_search_tables])
+
+@utils.log_params
+def get_relevant_tables_json(vector_search_tables, filtered_tables):
     def quote_table_name(table):
         """
         This function is necessary to show LLM how to format table names in VQL, by adding quotes around the database and view names.	
@@ -136,27 +225,50 @@ def get_relevant_tables_json(vector_search_tables, filtered_tables, vector_store
         return str(table['view_json'])
 
     if not filtered_tables:
-        return '\n'.join([quote_table_name({'view_json': json.loads(table['view_json'])}) for table in vector_search_tables])
+        return '\n'.join([quote_table_name({'view_json': json.loads(json.dumps(table['view_json']))}) for table in vector_search_tables])
     else:
-        vector_store_views = vector_store.get_views(filtered_tables)
-        return '\n'.join([quote_table_name({'view_json': json.loads(view.metadata['view_json'])}) for view in vector_store_views])
+        to_return = []
+        # Create a lookup dictionary for faster access
+        table_lookup = {t['view_name']: t['view_json'] for t in vector_search_tables}
+        
+        for filtered_table in filtered_tables:
+            table_name = utils.custom_tag_parser(filtered_table, 'name', default='')[0].strip()
+            columns = utils.custom_tag_parser(filtered_table, 'column', default='')
+            
+            if table_name not in table_lookup:
+                continue
+                
+            table_json = table_lookup[table_name].copy()  # Shallow copy is sufficient here
+            
+            if columns[0] != '':
+                # Filter schema to include only specified columns
+                table_json['schema'] = [
+                    col for col in table_json['schema'] 
+                    if col['columnName'] in columns
+                ]
+            
+            to_return.append(quote_table_name({'view_json': table_json}))
+        if to_return:
+            return '\n'.join(to_return)
+        else:
+            return '\n'.join([quote_table_name({'view_json': json.loads(json.dumps(table['view_json']))}) for table in vector_search_tables])
 
 @utils.log_params
 @utils.timed
-def metadata_category(query, vector_search_tables, llm_provider, llm_model, custom_instructions = ''):
+async def metadata_category(query, vector_search_tables, llm_provider, llm_model, custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
 
     prompt = PromptTemplate.from_template(METADATA_CATEGORY_PROMPT)
     chain = prompt | llm.llm | StrOutputParser()
 
-    response = chain.invoke(
+    response = await chain.ainvoke(
         {
             "instruction": query,
             "schema": [table['view_json'] for table in vector_search_tables],
             "custom_instructions": custom_instructions
         },
         config={
-            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
             "run_name": inspect.currentframe().f_code.co_name,
         }
     )
@@ -168,20 +280,20 @@ def metadata_category(query, vector_search_tables, llm_provider, llm_model, cust
 
 @utils.log_params
 @utils.timed
-def direct_metadata_category(query, vector_search_tables, llm_provider, llm_model, custom_instructions = ''):
+async def direct_metadata_category(query, vector_search_tables, llm_provider, llm_model, custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
 
     prompt = PromptTemplate.from_template(DIRECT_METADATA_CATEGORY_PROMPT)
     chain = prompt | llm.llm | StrOutputParser()
 
-    response = chain.invoke(
+    response = await chain.ainvoke(
         {
             "instruction": query,
             "schema": [table['view_json'] for table in vector_search_tables],
             "custom_instructions": custom_instructions
         },
         config={
-            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
             "run_name": inspect.currentframe().f_code.co_name,
         }
     )
@@ -194,17 +306,17 @@ def direct_metadata_category(query, vector_search_tables, llm_provider, llm_mode
 
 @utils.log_params
 @utils.timed
-def direct_sql_category(query, vector_search_tables, llm_provider, llm_model, custom_instructions = ''):
+async def direct_sql_category(query, vector_search_tables, llm_provider, llm_model, custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
     prompt = PromptTemplate.from_template(DIRECT_SQL_CATEGORY_PROMPT)
     chain = prompt | llm.llm | StrOutputParser()
 
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "instruction": query,
         "schema": sdk_utils.readable_tables(vector_search_tables),
         "custom_instructions": custom_instructions
     }, config={
-        "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+        "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
         "run_name": inspect.currentframe().f_code.co_name,
     })
 
@@ -216,97 +328,103 @@ def direct_sql_category(query, vector_search_tables, llm_provider, llm_model, cu
 
 @utils.log_params
 @utils.timed
-def sql_category(query, vector_search_tables, llm_provider, llm_model, mode = 'default', custom_instructions = ''):
+async def sql_category(query, vector_search_tables, llm_provider, llm_model, mode = 'default', custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
     prompt = PromptTemplate.from_template(SQL_CATEGORY_PROMPT)
     chain = prompt | llm.llm | StrOutputParser()
 
     if mode == 'metadata':
-        return direct_metadata_category(
+        return await direct_metadata_category(
             query=query, 
             vector_search_tables=vector_search_tables, 
             llm_provider=llm_provider, 
             llm_model=llm_model,
-            custom_instructions=custom_instructions
+            custom_instructions=custom_instructions,
+            session_id=session_id
         )
 
     if mode == 'data':
-        return direct_sql_category(
+        return await direct_sql_category(
             query=query, 
             vector_search_tables=vector_search_tables, 
             llm_provider=llm_provider, 
             llm_model=llm_model,
-            custom_instructions=custom_instructions
+            custom_instructions=custom_instructions,
+            session_id=session_id
         )
     else:
-        with ThreadPoolExecutor(max_workers = 2) as executor:
-            metadata_future = executor.submit(
-                metadata_category, 
+        # Create tasks for both operations to run in parallel
+        metadata_task = asyncio.create_task(
+            metadata_category(
                 query=query, 
                 vector_search_tables=vector_search_tables, 
                 llm_provider=llm_provider, 
                 llm_model=llm_model,
-                custom_instructions=custom_instructions
+                custom_instructions=custom_instructions,
+                session_id=session_id
             )
-            sql_future = executor.submit(chain.invoke, {
+        )
+        
+        sql_task = asyncio.create_task(
+            chain.ainvoke({
                 "instruction": query,
                 "schema": sdk_utils.readable_tables(vector_search_tables),
                 "custom_instructions": custom_instructions
             }, config={
-                "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+                "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
                 "run_name": inspect.currentframe().f_code.co_name,
             })
-
-            # Wait for metadata_category to complete first
-            metadata_result = metadata_future.result()
+        )
+        
+        # Wait for either task to complete
+        done, pending = await asyncio.wait(
+            {metadata_task, sql_task}, 
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Get the first completed task
+        first_completed = list(done)[0]
+        
+        # If metadata_task completed first and returned METADATA
+        if first_completed == metadata_task:
+            metadata_result = first_completed.result()
             if metadata_result[0] == "METADATA":
+                # Cancel the SQL task
+                sql_task.cancel()
                 return metadata_result
-
-            # If not METADATA, continue with sql_category
-            response = sql_future.result()
-
-    category = utils.custom_tag_parser(response, 'cat', default="OTHER")[0].strip()
-    filter_params = utils.custom_tag_parser(response, 'query', default=[])
-    sql_related_questions = []
-
-    return category, filter_params[0] if len(filter_params) > 0 else None, sql_related_questions, llm.tokens
-
-@utils.log_params
-@utils.timed
-def get_concepts(query, llm_provider, llm_model):
-    llm = UniformLLM(llm_provider, llm_model)
-
-    prompt = PromptTemplate.from_template(GET_CONCEPTS_PROMPT)
-    chain = prompt | llm.llm | StrOutputParser()
-
-    response = chain.invoke(
-        {"query": query},
-        config = {
-            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
-            "run_name": inspect.currentframe().f_code.co_name,
-        }
-    )
-
-    concepts = utils.custom_tag_parser(response, 'search')
-    return concepts, llm.tokens
+                
+        # If sql_task is already done, get its result
+        if sql_task in done:
+            response = sql_task.result()
+        else:
+            # Otherwise wait for sql_task to complete
+            response = await sql_task
+        
+        category = utils.custom_tag_parser(response, 'cat', default="OTHER")[0].strip()
+        filter_params = utils.custom_tag_parser(response, 'query', default=[])
+        sql_related_questions = []
+        
+        return category, filter_params[0] if len(filter_params) > 0 else '', sql_related_questions, llm.tokens
 
 @utils.log_params
 @utils.timed
-def graph_generator(query, data_file, execution_result, llm_provider, llm_model, details = 'No special requirements'):
+async def graph_generator(query, data_file, execution_result, llm_provider, llm_model, details = 'No special requirements', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
-
     final_prompt = PromptTemplate.from_template(GENERATE_VISUALIZATION_PROMPT)
     final_chain = final_prompt | llm.llm | StrOutputParser()
 
-    response = final_chain.invoke({
+    # Get the first 3 available rows in execution_result, if they exist
+    sample_data = {f"Row {i+1}": execution_result[f"Row {i+1}"] for i in range(3) if f"Row {i+1}" in execution_result}
+
+    response = await final_chain.ainvoke({
         "data": data_file, 
         "details": details,
         "instruction": query,
         "plot_details": details,
-        "sample_data": json.dumps({'Row 1': execution_result['Row 1']})
+        "sample_data": json.dumps(sample_data)
     }, 
         config = {
-            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
             "run_name": inspect.currentframe().f_code.co_name,
         }
     )
@@ -324,17 +442,19 @@ def graph_generator(query, data_file, execution_result, llm_provider, llm_model,
 
 @utils.log_params
 @utils.timed
-def query_fixer(query, llm_provider, llm_model, error_log=False, error_categories=[]):
+def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, error_log=False, error_categories=[], fixer_history=[], session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
     
     if not error_log:
         query, error_log, error_categories = sdk_utils.prepare_vql(query)
 
-    prompt, parameters = _get_prompt_and_parameters(query, error_log, error_categories)
+    schema = [table for table in vector_search_tables if table['view_name'] in query.replace('"', '')]
+    relevant_tables = format_schema_text(schema, [])
+    prompt, parameters = _get_prompt_and_parameters(question, query, error_log, error_categories, relevant_tables)
     
     if not prompt:
         logging.info("VQL query is valid, continuing execution.")
-        return query, llm.tokens
+        return query, fixer_history, llm.tokens
 
     final_prompt = PromptTemplate.from_template(prompt)
     final_chain = final_prompt | llm.llm | StrOutputParser()
@@ -342,15 +462,70 @@ def query_fixer(query, llm_provider, llm_model, error_log=False, error_categorie
     response = final_chain.invoke(
         parameters, 
         config = {
-            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}"),
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
             "run_name": inspect.currentframe().f_code.co_name,
         }
     )
     
-    fixed_vql_query, error_log, error_categories = sdk_utils.prepare_vql(utils.custom_tag_parser(response, 'vql', default='')[0].strip())
-    return fixed_vql_query, llm.tokens
+    if '```' in response:
+        response = response.replace('```vql', '<vql>').replace('```', '</vql>').strip()
 
-def _get_prompt_and_parameters(vql_query, error_log, error_categories):
+    vql_query = utils.custom_tag_parser(response, 'vql', default='')[0].strip()
+
+    fixed_vql_query, error_log, error_categories = sdk_utils.prepare_vql(vql_query)
+    input_prompt = final_prompt.format(**parameters)
+    fixer_history.extend([('human', input_prompt), ('ai', response)])
+    return fixed_vql_query, fixer_history, llm.tokens
+
+@utils.log_params
+@utils.timed
+def query_reviewer(question, vql_query, llm_provider, llm_model, vector_search_tables, session_id = None, fixer_history=[]):
+    llm = UniformLLM(llm_provider, llm_model)
+    final_prompt = PromptTemplate.from_template(QUERY_REVIEWER_PROMPT)
+    final_chain = final_prompt | llm.llm | StrOutputParser()
+
+    schema = [table for table in vector_search_tables if table['view_name'] in vql_query.replace('"', '')]
+    relevant_tables = format_schema_text(schema, [])
+
+    vql_restrictions = sdk_utils.generate_vql_restrictions(
+        prompt_parts={"dates": 1, "arithmetic": 1, "groupby": 1, "having": 1},
+        vql_rules_prompt=VQL_RULES_PROMPT,
+        groupby_vql_prompt=GROUPBY_VQL_PROMPT,
+        having_vql_prompt=HAVING_VQL_PROMPT,
+        dates_vql_prompt=DATES_VQL_PROMPT,
+        arithmetic_vql_prompt=ARITHMETIC_VQL_PROMPT,
+    )
+
+    vql_rules = f"Here are the VQL generation rules:\n<vql_rules>\n{vql_restrictions}\n</vql_rules>"
+
+    response = final_chain.invoke(
+        {
+            "question": question,
+            "vql_restrictions": '',
+            "query": vql_query,
+            "schema": relevant_tables
+        }, 
+        config = {
+            "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
+            "run_name": inspect.currentframe().f_code.co_name,
+        }
+    )
+
+    if '```' in response:
+        response = response.replace('```vql', '<vql>').replace('```', '</vql>').strip()
+
+    vql_query = utils.custom_tag_parser(response, 'vql', default='')[0].strip()
+    new_vql_query, _, _ = sdk_utils.prepare_vql(vql_query)
+    input_prompt = final_prompt.format(**{
+        "question": question,
+        "vql_restrictions": vql_rules,
+        "query": vql_query,
+        "schema": relevant_tables
+    })
+    fixer_history.extend([('human', input_prompt), ('ai', response)])
+    return new_vql_query, fixer_history, llm.tokens
+
+def _get_prompt_and_parameters(question, vql_query, error_log, error_categories, schema):
     error_handlers = {
         "LIMIT_SUBQUERY": (FIX_LIMIT_PROMPT, "LIMIT in subquery detected, fixing."),
         "LIMIT_OFFSET": (FIX_OFFSET_PROMPT, "LIMIT OFFSET detected, fixing."),
@@ -359,7 +534,7 @@ def _get_prompt_and_parameters(vql_query, error_log, error_categories):
     for category, (prompt, log_message) in error_handlers.items():
         if category in error_categories:
             logging.info(log_message)
-            return prompt, {"query": vql_query}
+            return prompt, {"query": vql_query, "schema": schema, "question": question}
 
     if error_log:
         logging.info("VQL generation failed, fixing query.")
@@ -374,61 +549,82 @@ def _get_prompt_and_parameters(vql_query, error_log, error_categories):
         return QUERY_FIXER_PROMPT, {
             "query": vql_query,
             "query_error": error_log,
-            "vql_restrictions": vql_restrictions
+            "vql_restrictions": vql_restrictions,
+            "schema": schema,
+            "question": question
         }
 
     return None, None
 
 @utils.log_params
 @utils.timed
-def get_relevant_tables(
-    query,
-    embeddings_provider,
-    embeddings_model,
-    vector_store_provider,
-    vdb_list,
-    auth,
-    k = 5,
-    user_permissions = False,
-    use_views = '',
-    expand_set_views = True
-):    
-    embeddings = UniformEmbeddings(embeddings_provider, embeddings_model)
-    vdb_list = [db.strip() for db in vdb_list.split(',')]
-    
-    vector_store = UniformVectorStore(
-        provider = vector_store_provider,
-        embeddings_provider = embeddings_provider,
-        embeddings_model = embeddings_model,
-    )
+def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_store_provider, vdb_list, tag_list,auth, k = 5, use_views = '', expand_set_views = True):
+    vdb_list = [db.strip() for db in vdb_list.split(',')] if vdb_list else []
+    tag_list = [tag.strip() for tag in tag_list.split(',')] if tag_list else []
     
     timings = {}
 
-    embedded_query = embeddings.model.embed_query(query)
+    vector_store = UniformVectorStore(
+        provider = vector_store_provider,
+        embeddings_provider = embeddings_provider,
+        embeddings_model = embeddings_model
+    )
 
+    if not vdb_list and not tag_list:
+        vdb_list = vector_store.get_database_names()
+        tag_list = vector_store.get_tag_names()
+    
+    embedded_query = vector_store.embeddings.embed_query(query)
     search_params = {
         "vector": embedded_query,
         "k": k,
         "scores": False,
-        "database_names": vdb_list
+        "database_names": vdb_list,
+        "tag_names": tag_list
     }
 
-    if user_permissions:
-        valid_view_ids = get_allowed_view_ids(auth = auth, database_names = vdb_list)
-        valid_view_ids = [str(view_id) for view_id in valid_view_ids]
-        search_params["view_ids"] = valid_view_ids
+    valid_view_ids = get_allowed_view_ids(auth = auth, database_names = vdb_list, tag_names = tag_list)
+    valid_view_ids = [str(view_id) for view_id in valid_view_ids]
+    search_params["view_ids"] = valid_view_ids
 
     with sdk_utils.timing_context("vector_store_search_time", timings):
         vector_search = vector_store.search_by_vector(**search_params)
 
-    relevant_tables = [
-        {
-            "view_text": table.page_content,
-            "view_name": table.metadata['view_name'],
-            "view_json": json.loads(table.metadata['view_json'])
-        }
-        for table in vector_search
-    ]
+    # Keep track of seen view_names to remove duplicates
+    seen_view_ids = set()
+    relevant_tables = []
+
+    for table in vector_search:
+        view_id = table.metadata['view_id']
+        if view_id not in seen_view_ids:
+            seen_view_ids.add(view_id)
+            relevant_tables.append({
+                "view_text": table.page_content,
+                "view_name": table.metadata['view_name'],
+                "view_json": json.loads(table.metadata['view_json'])
+            })
+
+    MAX_ROUNDS = 2
+    current_round = 0
+    
+    while len(relevant_tables) < k and len(valid_view_ids) > len(relevant_tables) and current_round < MAX_ROUNDS:
+        remaining_view_ids = [view_id for view_id in valid_view_ids if view_id not in seen_view_ids]
+        search_params["view_ids"] = remaining_view_ids        
+        new_search = vector_store.search_by_vector(**search_params)
+        if not new_search:  # Break if no new results found
+            break
+            
+        for table in new_search:
+            view_id = table.metadata['view_id']
+            if view_id not in seen_view_ids and len(relevant_tables) < k:
+                seen_view_ids.add(view_id)
+                relevant_tables.append({
+                    "view_text": table.page_content,
+                    "view_name": table.metadata['view_name'],
+                    "view_json": json.loads(table.metadata['view_json'])
+                })
+        
+        current_round += 1
 
     existing_view_names = set(table['view_name'] for table in relevant_tables)
     new_associations = []
@@ -454,14 +650,14 @@ def get_relevant_tables(
     if new_associations:
         # Lookup new associations in vector_store
         with sdk_utils.timing_context("vector_store_search_time", timings):
-            association_lookup = vector_store.get_views(new_associations, valid_view_ids if user_permissions else None)
+            association_lookup = vector_store.get_views(new_associations, valid_view_ids)
 
         # Add new associations to relevant_tables
         for assoc in association_lookup:
             relevant_tables.append({
                 "view_text": assoc.page_content,
                 "view_name": assoc.metadata['view_name'],
-                "view_json": json.loads(assoc.metadata['view_json']) if not user_permissions else sdk_utils.filter_non_allowed_associations(json.loads(assoc.metadata['view_json']), valid_view_ids)
+                "view_json": sdk_utils.filter_non_allowed_associations(json.loads(assoc.metadata['view_json']), valid_view_ids)
             })
 
     if not expand_set_views:

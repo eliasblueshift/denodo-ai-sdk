@@ -2,47 +2,72 @@ import os
 import json
 import random
 import string
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 from api.utils import sdk_ai_tools
 from utils.data_catalog import execute_vql
-from api.utils.sdk_utils import timing_context, is_data_complex
+from utils.uniformLLM import UniformLLM
+from utils.utils import custom_tag_parser, add_langfuse_callback
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from api.utils.sdk_utils import timing_context, is_data_complex, add_tokens
 
-def process_sql_category(request, vector_search_tables, category_response, auth, timings):
+async def process_sql_category(request, vector_search_tables, category_response, auth, timings, session_id = None):
     with timing_context("llm_time", timings):
-        vql_query, to_execute, query_explanation, query_to_vql_tokens = sdk_ai_tools.query_to_vql(
+        vql_query, query_explanation, query_to_vql_tokens = sdk_ai_tools.query_to_vql(
             query=request.question, 
             vector_search_tables=vector_search_tables, 
             llm_provider=request.sql_gen_provider, 
             llm_model=request.sql_gen_model, 
-            vector_store_provider=request.vector_store_provider, 
-            embeddings_provider=request.embeddings_provider, 
-            embeddings_model=request.embeddings_model, 
             filter_params=category_response,
-            custom_instructions=request.custom_instructions
+            custom_instructions=request.custom_instructions,
+            session_id=session_id
         )
 
-        vql_query, query_fixer_tokens = sdk_ai_tools.query_fixer(
+        vql_query, _, query_fixer_tokens = sdk_ai_tools.query_fixer(
+            question=request.question,
             query=vql_query, 
             llm_provider=request.sql_gen_provider, 
-            llm_model=request.sql_gen_model
+            llm_model=request.sql_gen_model,
+            session_id=session_id,
+            vector_search_tables=vector_search_tables
         )
 
-    execution_result, vql_status_code, timings = execute_query(
-        vql_query=vql_query, 
-        to_execute=to_execute, 
-        auth=auth, 
-        timings=timings
-    )
+    max_attempts = 2
+    attempt = 0
+    fixer_history = []
+    original_vql_query = vql_query
 
-    if vql_status_code == 500:
-        vql_query, execution_result, vql_status_code, timings = handle_query_error(
-            vql_query=vql_query, 
-            execution_result=execution_result, 
-            request=request, 
-            auth=auth, 
-            timings=timings
+    while attempt < max_attempts:
+        vql_query, execution_result, vql_status_code, timings, fixer_history, query_fixer_tokens = attempt_query_execution(
+            vql_query=vql_query,
+            request=request,
+            auth=auth,
+            timings=timings,
+            vector_search_tables=vector_search_tables,
+            session_id=session_id,
+            query_fixer_tokens=query_fixer_tokens,
+            fixer_history=fixer_history
         )
+        
+        if vql_query == 'OK':
+            vql_query = original_vql_query
+            break
+        elif vql_status_code not in [499, 500]:
+            break
+            
+        attempt += 1
+
+    if vql_status_code in [499, 500]:
+        if vql_query:
+            execution_result, vql_status_code, timings = execute_query(
+                vql_query=vql_query, 
+                auth=auth, 
+                timings=timings
+            )
+        else:
+            vql_status_code = 500
+            execution_result = "No VQL query was generated."
 
     llm_execution_result = prepare_execution_result(
         execution_result=execution_result, 
@@ -54,7 +79,7 @@ def process_sql_category(request, vector_search_tables, category_response, auth,
     response = prepare_response(
         vql_query=vql_query, 
         query_explanation=query_explanation, 
-        query_to_vql_tokens=query_to_vql_tokens, 
+        tokens=add_tokens(query_to_vql_tokens, query_fixer_tokens), 
         execution_result=execution_result if vql_status_code == 200 else {}, 
         vector_search_tables=vector_search_tables, 
         raw_graph=raw_graph, 
@@ -62,14 +87,15 @@ def process_sql_category(request, vector_search_tables, category_response, auth,
     )
 
     if request.verbose or request.plot:
-        response = enhance_verbose_response(
+        response = await enhance_verbose_response(
             request=request, 
             response=response, 
             vql_query=vql_query, 
             llm_execution_result=llm_execution_result, 
             vector_search_tables=vector_search_tables, 
             data_file=data_file, 
-            timings=timings
+            timings=timings,
+            session_id=session_id
         )
 
     if request.disclaimer:
@@ -80,14 +106,14 @@ def process_sql_category(request, vector_search_tables, category_response, auth,
 
     return response
 
-def process_metadata_category(category_response, category_related_questions, disclaimer, vector_search_tables, timings):
+def process_metadata_category(category_response, category_related_questions, disclaimer, vector_search_tables, timings, tokens):
     if disclaimer:
         category_response += "\n\nDISCLAIMER: This response has been generated based on an LLM's interpretation of the data and may not be accurate."
     return {
         'answer': category_response,
         'sql_query': '',
         'query_explanation': '',
-        'tokens': {},
+        'tokens': tokens,
         'related_questions': category_related_questions,
         'execution_result': {},
         'tables_used': [table['view_name'] for table in vector_search_tables],
@@ -105,7 +131,7 @@ def process_unknown_category(timings):
         'answer': ERROR_MESSAGE,
         'sql_query': '',
         'query_explanation': '',
-        'tokens': {},
+        'tokens': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0},
         'related_questions': [],
         'execution_result': {},
         'tables_used': '',
@@ -116,38 +142,74 @@ def process_unknown_category(timings):
         'total_execution_time': round(sum(timings.values()), 2) if timings else 0
     }
 
-def execute_query(vql_query, to_execute, auth, timings):
-    with timing_context("vql_execution_time", timings):
-        if to_execute:
-            vql_status_code, execution_result = execute_vql(vql=vql_query, auth=auth)
-        else:
-            vql_status_code, execution_result = 200, f'User asked not to execute the query, so return the SQL query instead:\n{vql_query}'
-    return execution_result, vql_status_code, timings
-
-def handle_query_error(vql_query, execution_result, request, auth, timings):
-    with timing_context("llm_time", timings):
-        vql_query, query_fixer_tokens = sdk_ai_tools.query_fixer(
-            query=vql_query, 
-            error_log=execution_result,
-            llm_provider=request.sql_gen_provider,
-            llm_model=request.sql_gen_model
-        )
-
-    if vql_query is not None:
+def attempt_query_execution(vql_query, request, auth, timings, vector_search_tables, session_id, query_fixer_tokens=None, fixer_history=[]):
+    if vql_query:
         execution_result, vql_status_code, timings = execute_query(
             vql_query=vql_query, 
-            to_execute=True, 
             auth=auth, 
             timings=timings
         )
     else:
         vql_status_code = 500
-        execution_result = "There are errors in the query."
+        execution_result = "No VQL query was generated."
 
-    if vql_status_code == 499:
-        execution_result = "The query returned no rows."
+    if vql_status_code not in [499, 500]:
+        return vql_query, execution_result, vql_status_code, timings, fixer_history, query_fixer_tokens
 
-    return vql_query, execution_result, vql_status_code, timings
+    if fixer_history:
+        with timing_context("llm_time", timings):
+            escape_execution_result = execution_result.replace("{", "{{").replace("}", "}}")
+            fixer_history.append(('human', f'Your response resulted in the following error {vql_status_code}: {escape_execution_result}'))
+            llm = UniformLLM(request.sql_gen_provider, request.sql_gen_model)
+            prompt = ChatPromptTemplate.from_messages(fixer_history)
+            chain = prompt | llm.llm | StrOutputParser()
+            response = chain.invoke({}, config = {
+            "callbacks": add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
+            "run_name": "fixer_dialogue",
+        }
+)
+        vql_query = custom_tag_parser(response, 'vql', default='')[0].strip()
+        fixer_history.append(('ai', response))
+        query_fixer_tokens = add_tokens(query_fixer_tokens or {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}, 
+                                    llm.tokens)
+    else:
+        if vql_status_code == 500:
+            with timing_context("llm_time", timings):
+                vql_query, fixer_history, query_fixer_tokens = sdk_ai_tools.query_fixer(
+                    question=request.question,
+                    query=vql_query, 
+                    error_log=execution_result,
+                    llm_provider=request.sql_gen_provider,
+                    llm_model=request.sql_gen_model,
+                    session_id=session_id,
+                    vector_search_tables=vector_search_tables,
+                    fixer_history=fixer_history
+                )            
+        elif vql_status_code == 499:
+            with timing_context("llm_time", timings):
+                vql_query, fixer_history, query_reviewer_tokens = sdk_ai_tools.query_reviewer(
+                    question=request.question,
+                    vql_query=vql_query,
+                    llm_provider=request.sql_gen_provider,
+                    llm_model=request.sql_gen_model,
+                    vector_search_tables=vector_search_tables,
+                    session_id=session_id,
+                    fixer_history=fixer_history
+                )
+            
+            query_fixer_tokens = add_tokens(query_fixer_tokens or {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}, 
+                                        query_reviewer_tokens)
+            
+    return vql_query, execution_result, vql_status_code, timings, fixer_history, query_fixer_tokens
+
+def execute_query(vql_query, auth, timings):
+    with timing_context("vql_execution_time", timings):
+        if vql_query:
+            vql_status_code, execution_result = execute_vql(vql=vql_query, auth=auth)
+        else:
+            vql_status_code = 499
+            execution_result = "No VQL query was generated."
+    return execution_result, vql_status_code, timings
 
 def prepare_execution_result(execution_result, vql_status_code):
     if vql_status_code == 200 and isinstance(execution_result, dict) and len(execution_result) > 15:
@@ -172,13 +234,12 @@ def handle_plotting(request, execution_result):
 
     return '', data_file, request
 
-def prepare_response(vql_query, query_explanation, query_to_vql_tokens, 
-                     execution_result, vector_search_tables, raw_graph, timings):
+def prepare_response(vql_query, query_explanation, tokens, execution_result, vector_search_tables, raw_graph, timings):
     return {
         "answer": vql_query,
-        "sql_query": vql_query,
+        "sql_query": vql_query if "FROM" in vql_query else "",
         "query_explanation": query_explanation,
-        "tokens": query_to_vql_tokens,
+        "tokens": tokens,
         "related_questions": [],
         "execution_result": execution_result,
         "tables_used": [table['view_name'] for table in vector_search_tables],
@@ -189,41 +250,61 @@ def prepare_response(vql_query, query_explanation, query_to_vql_tokens,
         "total_execution_time": round(sum(timings.values()), 2)
     }
 
-def enhance_verbose_response(request, response, vql_query, llm_execution_result, 
-                             vector_search_tables, data_file, timings):
+async def enhance_verbose_response(request, response, vql_query, llm_execution_result, vector_search_tables, data_file, timings, session_id = None):
     with timing_context("llm_time", timings):
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {}
-            
-            if request.plot:
-                futures['graph'] = executor.submit(
-                    sdk_ai_tools.graph_generator,
-                    query=request.question,
-                    data_file=data_file,
-                    execution_result=response['execution_result'],
-                    llm_provider=request.sql_gen_provider,
-                    llm_model=request.sql_gen_model,
-                    details=request.plot_details
-                )
-            
-            if request.verbose:
-                futures['answer'] = executor.submit(
-                    sdk_ai_tools.generate_view_answer,
-                    query=request.question,
-                    vql_query=vql_query,
-                    vql_execution_result=llm_execution_result,
-                    llm_provider=request.chat_provider,
-                    llm_model=request.chat_model,
-                    vector_search_tables=vector_search_tables,
-                    markdown_response=request.markdown_response,
-                    custom_instructions=request.custom_instructions,
-                    stream=False
-                )
+        tasks = []
+        
+        if request.plot:
+            graph_task = sdk_ai_tools.graph_generator(
+                query=request.question,
+                data_file=data_file,
+                execution_result=response['execution_result'],
+                llm_provider=request.sql_gen_provider,
+                llm_model=request.sql_gen_model,
+                details=request.plot_details,
+                session_id=session_id
+            )
+            tasks.append(graph_task)
+        
+        if request.verbose:
+            answer_task = sdk_ai_tools.generate_view_answer(
+                query=request.question,
+                vql_query=vql_query,
+                vql_execution_result=llm_execution_result,
+                llm_provider=request.chat_provider,
+                llm_model=request.chat_model,
+                vector_search_tables=vector_search_tables,
+                markdown_response=request.markdown_response,
+                custom_instructions=request.custom_instructions,
+                session_id=session_id
+            )
+            related_questions_task = sdk_ai_tools.related_questions(
+                question=request.question,
+                sql_query=vql_query,
+                execution_result=llm_execution_result,
+                vector_search_tables=vector_search_tables,
+                llm_provider=request.chat_provider,
+                llm_model=request.chat_model,
+                custom_instructions=request.custom_instructions,
+                session_id=session_id
+            )
+            tasks.append(answer_task)
+            tasks.append(related_questions_task)
 
-            if request.plot:
-                response['raw_graph'], graph_tokens = futures['graph'].result()
+        # Execute all tasks concurrently
+        results = await asyncio.gather(*tasks)
+        
+        # Process results
+        result_index = 0
+        if request.plot:
+            response['raw_graph'], graph_tokens = results[result_index]
+            response['tokens'] = add_tokens(response['tokens'], graph_tokens)
+            result_index += 1
 
-            if request.verbose:
-                response['answer'], response['related_questions'], response['tokens'] = futures['answer'].result()
+        if request.verbose:
+            response['answer'], verbose_tokens = results[result_index]
+            response['related_questions'], related_questions_tokens = results[result_index + 1]
+            response['tokens'] = add_tokens(response['tokens'], verbose_tokens)
+            response['tokens'] = add_tokens(response['tokens'], related_questions_tokens)
 
     return response

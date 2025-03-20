@@ -2,11 +2,9 @@ import os
 import sys
 import json
 import hashlib
-import requests
 import logging
 import warnings
 
-from functools import lru_cache
 from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_httpauth import HTTPBasicAuth
@@ -15,6 +13,7 @@ from utils.uniformLLM import UniformLLM
 from sample_chatbot.chatbot_engine import ChatbotEngine
 from sample_chatbot.chatbot_tools import denodo_query, metadata_query, kb_lookup
 from sample_chatbot.chatbot_config_loader import load_config
+from sample_chatbot.chatbot_utils import ai_sdk_health_check, get_relevant_tables
 from sample_chatbot.chatbot_utils import dummy_login, prepare_unstructured_vector_store, check_env_variables, connect_to_ai_sdk, process_chunk
 
 required_vars = [
@@ -25,8 +24,6 @@ required_vars = [
     'CHATBOT_SYSTEM_PROMPT',
     'CHATBOT_TOOL_SELECTION_PROMPT',
     'AI_SDK_HOST',
-    'AI_SDK_USERNAME',
-    'AI_SDK_PASSWORD',
     'DATABASE_QUERY_TOOL',
     'KNOWLEDGE_BASE_TOOL',
     'METADATA_QUERY_TOOL'
@@ -64,15 +61,14 @@ CHATBOT_TOOL_SELECTION_PROMPT = os.environ['CHATBOT_TOOL_SELECTION_PROMPT']
 CHATBOT_KNOWLEDGE_BASE_TOOL = os.environ['KNOWLEDGE_BASE_TOOL']
 CHATBOT_METADATA_QUERY_TOOL = os.environ['METADATA_QUERY_TOOL']
 CHATBOT_DATABASE_QUERY_TOOL = os.environ['DATABASE_QUERY_TOOL']
-CHATBOT_OVERWRITE_ON_LOAD = bool(os.getenv('CHATBOT_OVERWRITE_ON_LOAD', True))
-CHATBOT_EXAMPLES_PER_TABLE = int(os.getenv('CHATBOT_EXAMPLES_PER_TABLE', 3))
 CHATBOT_HOST = os.getenv('CHATBOT_HOST', '0.0.0.0')
 CHATBOT_PORT = int(os.getenv('CHATBOT_PORT', 9992))
 CHATBOT_SSL_CERT = os.getenv('CHATBOT_SSL_CERT')
 CHATBOT_SSL_KEY = os.getenv('CHATBOT_SSL_KEY')
-AI_SDK_HOST = os.environ['AI_SDK_HOST']
-AI_SDK_USERNAME = os.environ['AI_SDK_USERNAME']
-AI_SDK_PASSWORD = os.environ['AI_SDK_PASSWORD']
+AI_SDK_HOST = os.getenv('AI_SDK_HOST', 'http://localhost:8008')
+AI_SDK_USERNAME = os.getenv('AI_SDK_USERNAME')
+AI_SDK_PASSWORD = os.getenv('AI_SDK_PASSWORD')
+DATA_CATALOG_URL = os.getenv('DATA_CATALOG_URL')
 
 logging.info("Chatbot parameters:")
 logging.info(f"    - LLM Provider: {CHATBOT_LLM_PROVIDER}")
@@ -81,26 +77,15 @@ logging.info(f"    - Embeddings Provider: {CHATBOT_EMBEDDINGS_PROVIDER}")
 logging.info(f"    - Embeddings Model: {CHATBOT_EMBEDDINGS_MODEL}")
 logging.info(f"    - Vector Store Provider: {CHATBOT_VECTOR_STORE_PROVIDER}")
 logging.info(f"    - AI SDK Host: {AI_SDK_HOST}")
-logging.info(f"    - Overwrite AI SDK vector stores on load: {CHATBOT_OVERWRITE_ON_LOAD}")
-logging.info(f"    - Examples per table: {CHATBOT_EXAMPLES_PER_TABLE}")
 logging.info(f"    - Using SSL: {bool(CHATBOT_SSL_CERT and CHATBOT_SSL_KEY)}")
 logging.info("Connecting to AI SDK...")
 
 # Connect to AI SDK
-success, result = connect_to_ai_sdk(
-    api_host=AI_SDK_HOST, 
-    username=AI_SDK_USERNAME, 
-    password=AI_SDK_PASSWORD, 
-    overwrite=CHATBOT_OVERWRITE_ON_LOAD,
-    examples_per_table=CHATBOT_EXAMPLES_PER_TABLE
-)
-
+success = ai_sdk_health_check(AI_SDK_HOST)
 if success:
-    VDB_LIST = result
-    logging.info(f"Connected to AI SDK successfully. Accessible VDBs: {VDB_LIST}")
+    logging.info(f"Connected to AI SDK successfully at {AI_SDK_HOST}")
 else:
-    logging.error(f"Failed to connect to AI SDK: {result}")
-    sys.exit(1)
+    logging.error(f"WARNING: Failed to connect to AI SDK at {AI_SDK_HOST}. Health check failed.")
 
 app = Flask(__name__, static_folder = 'frontend/build')
 app.config['UPLOAD_FOLDER'] = "uploads"
@@ -130,6 +115,7 @@ class User(UserMixin):
         self.tools = None
         self.tools_prompt = None
         self.chatbot = None
+        self.denodo_tables = None
 
         ## Initialize tools
         self.update_tools()
@@ -178,8 +164,8 @@ class User(UserMixin):
                 api_host=AI_SDK_HOST,
                 username=self.id,
                 password=self.password,
-                vdp_database_names=VDB_LIST,
-                vector_store_provider=CHATBOT_VECTOR_STORE_PROVIDER
+                vector_store_provider=CHATBOT_VECTOR_STORE_PROVIDER,
+                denodo_tables=self.denodo_tables
             )
         return self.chatbot
 
@@ -211,6 +197,17 @@ def login():
     user = User(username, password)
     users[username] = user
     login_user(user)
+    result, relevant_tables = get_relevant_tables(
+        AI_SDK_HOST,
+        username,
+        password,
+        "views",
+    )
+
+    if result and relevant_tables:
+        user.denodo_tables = "Some of the views in the user's Denodo instance: " + ", ".join(relevant_tables) + "... Use the Metadata tool to query all."
+    else:
+        user.denodo_tables = "No views where found in the user's Denodo instance. Either the user has no views, the connection is failing or he does not have enough permissions. Use the Metadata tool to check."
     
     if csv_file_path and csv_file_description:
         user.set_csv_data(csv_file_path, csv_file_description)
@@ -276,42 +273,34 @@ def clear_history():
     current_user.chatbot = None
     return jsonify({"message": f"Chat history cleared for user {current_user.id}"})
 
-@app.route("/get-vdbs", methods=["GET"])
+@app.route("/sync_vdbs", methods=["POST"])
 @login_required
-@lru_cache(maxsize = None)
-def get_vdbs():
-    return jsonify({"vdb_list": VDB_LIST}), 200
-
-@app.route("/sync_vdp", methods=["POST"])
-@login_required
-def sync_vdp():
+def sync_vdbs():
     vdbs_to_sync = request.json.get('vdbs', [])
-    
-    if not vdbs_to_sync:
-        return jsonify({"success": False, "message": "No VDBs provided for synchronization"}), 400
-
     vdp_database_names = ",".join(vdbs_to_sync)
-    
-    request_params = {
-        'insert_in_vector_db': True,
-        'overwrite_vector_db': True,
-        'examples_per_table': 3,
-        'vdp_database_names': vdp_database_names
-    }
-    
-    try:
-        response = requests.get(f'{AI_SDK_HOST}/getMetadata', params=request_params, auth=(AI_SDK_USERNAME, AI_SDK_PASSWORD))
-        if response.status_code == 404:
-            raise ValueError(f"getMetadata returned 404: {response.content.decode('utf-8')}")	
-        elif response.status_code == 500:
-            raise ValueError(f"getMetadata returned 500: {response.content.decode('utf-8')}")
-        else:
-            response.raise_for_status()
-        return jsonify({"success": True, "message": "VDP synchronization successful"}), 200
-    except requests.RequestException as e:
-        error_message = f"VDP synchronization failed: {str(e)}"
-        return jsonify({"success": False, "message": error_message}), 500
+    overwrite = request.json.get('overwrite', True)
+    examples_per_table = request.json.get('examples_per_table', 3)
+    parallel = request.json.get('parallel', True)
 
+    if not AI_SDK_USERNAME or not AI_SDK_PASSWORD:
+        return jsonify({"success": False, "message": "No AI SDK credentials provided, please configure AI_SDK_USERNAME and AI_SDK_PASSWORD in the .env file"}), 400
+    
+    success, result = connect_to_ai_sdk(
+        api_host=AI_SDK_HOST, 
+        username=AI_SDK_USERNAME, 
+        password=AI_SDK_PASSWORD, 
+        insert=True,
+        overwrite=overwrite,
+        examples_per_table=examples_per_table,
+        parallel=parallel,
+        vdp_database_names=vdp_database_names if vdp_database_names != "" else None
+    )
+
+    if success:
+        return jsonify({"success": True, "message": f"VectorDB synchronization successful for VDBs: {result}"}), 200
+    else:
+        return jsonify({"success": False, "message": result}), 500
+    
 @app.route('/logout', methods=['POST'])
 @login_required
 def logout():
@@ -319,6 +308,15 @@ def logout():
     users.pop(username, None)
     logout_user()
     return jsonify({"success": True, "message": "Logged out successfully"}), 200
+
+@app.route('/api/config', methods=['GET'])
+def get_config():
+    """Endpoint to expose configuration variables to the frontend."""
+    # Only include dataCatalogUrl if it's explicitly set in the environment
+    config = {}
+    if DATA_CATALOG_URL:
+        config["dataCatalogUrl"] = DATA_CATALOG_URL.rstrip('/')
+    return jsonify(config)
 
 @app.route('/', defaults = {'path': ''})
 @app.route('/<path:path>')

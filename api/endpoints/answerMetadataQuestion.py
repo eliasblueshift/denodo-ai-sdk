@@ -25,18 +25,19 @@ from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
 router = APIRouter()
-security_basic = HTTPBasic()
-security_bearer = HTTPBearer()
-
-# Get the authentication type from environment
-AUTH_TYPE = os.getenv("DATA_CATALOG_AUTH_TYPE", "http_basic")
-
-if AUTH_TYPE.lower() == "http_basic":
-    def authenticate(credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)]):
-        return (credentials.username, credentials.password)
-else:
-    def authenticate(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]):
-        return credentials.credentials
+security_basic = HTTPBasic(auto_error = False)
+security_bearer = HTTPBearer(auto_error = False)
+    
+def authenticate(
+        basic_credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)],
+        bearer_credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]
+        ):
+    if bearer_credentials is not None:
+        return bearer_credentials.credentials
+    elif basic_credentials is not None:
+        return (basic_credentials.username, basic_credentials.password)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
 class answerMetadataQuestionRequest(BaseModel):
     question: str
@@ -49,7 +50,8 @@ class answerMetadataQuestionRequest(BaseModel):
     sql_gen_model: str = os.getenv('SQL_GENERATION_MODEL')
     chat_provider: str = os.getenv('CHAT_PROVIDER')
     chat_model: str = os.getenv('CHAT_MODEL')
-    vdp_database_names: str = os.getenv('VDB_NAMES')
+    vdp_database_names: str = os.getenv('VDB_NAMES', '')
+    vdp_tag_names: str = os.getenv('VDB_TAGS', '')
     use_views: str = ''
     expand_set_views: bool = True
     custom_instructions: str = os.getenv('CUSTOM_INSTRUCTIONS', '')
@@ -72,8 +74,13 @@ class answerMetadataQuestionResponse(BaseModel):
     llm_time: float
     total_execution_time: float
 
-@router.get('/answerMetadataQuestion', response_class = JSONResponse, response_model = answerMetadataQuestionResponse, tags = ['Ask a Question'])
-def answer_metadata_question_get(
+@router.get(
+        '/answerMetadataQuestion',
+        response_class = JSONResponse,
+        response_model = answerMetadataQuestionResponse,
+        tags = ['Ask a Question']
+)
+async def answer_metadata_question_get(
     request: answerMetadataQuestionRequest = Depends(),
     auth: str = Depends(authenticate)
 ):
@@ -96,10 +103,14 @@ def answer_metadata_question_get(
 
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
     is a complex task that should be handled with a powerful LLM.'''
-    return process_metadata_question(request, auth)
+    return await process_metadata_question(request, auth)
 
-@router.post('/answerMetadataQuestion', response_class = JSONResponse, response_model = answerMetadataQuestionResponse, tags = ['Ask a Question'])
-def answer_metadata_question_post(
+@router.post(
+        '/answerMetadataQuestion',
+        response_class = JSONResponse,
+        response_model = answerMetadataQuestionResponse,
+        tags = ['Ask a Question'])
+async def answer_metadata_question_post(
     endpoint_request: answerMetadataQuestionRequest,
     auth: str = Depends(authenticate)
 ):
@@ -122,29 +133,26 @@ def answer_metadata_question_post(
 
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
     is a complex task that should be handled with a powerful LLM.'''
-    return process_metadata_question(endpoint_request, auth)
+    return await process_metadata_question(endpoint_request, auth)
 
-def process_metadata_question(request_data: answerMetadataQuestionRequest, auth: str):
+async def process_metadata_question(request_data: answerMetadataQuestionRequest, auth: str):
     """Main function to process the metadata question and return the answer"""
     try:
-        # Right now, not all Denodo instances have permissions implemented. This should be deleted in the future.
-        USER_PERMISSIONS = int(os.getenv("USER_PERMISSIONS", 0))
-
         vector_search_tables, timings = sdk_ai_tools.get_relevant_tables(
             query=request_data.question,
             embeddings_provider=request_data.embeddings_provider,
             embeddings_model=request_data.embeddings_model,
             vector_store_provider=request_data.vector_store_provider,
             vdb_list=request_data.vdp_database_names,
+            tag_list=request_data.vdp_tag_names,
             auth=auth,
             k=request_data.vector_search_k,
-            user_permissions=USER_PERMISSIONS,
             use_views=request_data.use_views,
             expand_set_views=request_data.expand_set_views
         )
 
         with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = sdk_ai_tools.sql_category(
+            _, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
                 query=request_data.question, 
                 vector_search_tables=vector_search_tables, 
                 llm_provider=request_data.chat_provider,
@@ -158,6 +166,7 @@ def process_metadata_question(request_data: answerMetadataQuestionRequest, auth:
             category_related_questions=category_related_questions, 
             vector_search_tables=vector_search_tables, 
             timings=timings,
+            tokens=sql_category_tokens,
             disclaimer=request_data.disclaimer,
         )
 

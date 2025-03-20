@@ -17,26 +17,27 @@ from typing import Dict, Annotated, List, Literal
 
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context
+from api.utils.sdk_utils import timing_context, add_tokens, generate_session_id
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
 router = APIRouter()
-security_basic = HTTPBasic()
-security_bearer = HTTPBearer()
-
-# Get the authentication type from environment
-AUTH_TYPE = os.getenv("DATA_CATALOG_AUTH_TYPE", "http_basic")
-
-if AUTH_TYPE.lower() == "http_basic":
-    def authenticate(credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)]):
-        return (credentials.username, credentials.password)
-else:
-    def authenticate(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]):
-        return credentials.credentials
+security_basic = HTTPBasic(auto_error = False)
+security_bearer = HTTPBearer(auto_error = False)
+    
+def authenticate(
+        basic_credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)],
+        bearer_credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]
+        ):
+    if bearer_credentials is not None:
+        return bearer_credentials.credentials
+    elif basic_credentials is not None:
+        return (basic_credentials.username, basic_credentials.password)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
 class answerQuestionRequest(BaseModel):
     question: str
@@ -49,7 +50,8 @@ class answerQuestionRequest(BaseModel):
     sql_gen_model: str = os.getenv('SQL_GENERATION_MODEL')
     chat_provider: str = os.getenv('CHAT_PROVIDER')
     chat_model: str = os.getenv('CHAT_MODEL')
-    vdp_database_names: str = os.getenv('VDB_NAMES')
+    vdp_database_names: str = os.getenv('VDB_NAMES', '')
+    vdp_tag_names: str = os.getenv('VDB_TAGS', '')
     use_views: str = ''
     expand_set_views: bool = True
     custom_instructions: str = os.getenv('CUSTOM_INSTRUCTIONS', '')
@@ -96,8 +98,13 @@ This endpoint will also automatically look for the the following values in the e
 As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
 is a complex task that should be handled with a powerful LLM."""
 
-@router.get('/answerQuestion', response_class = JSONResponse, response_model=answerQuestionResponse, tags = ['Ask a Question'])
-def answer_question_get(
+@router.get(
+        '/answerQuestion',
+        response_class = JSONResponse,
+        response_model=answerQuestionResponse,
+        tags = ['Ask a Question']
+)
+async def answer_question_get(
     request: answerQuestionRequest = Depends(),
     auth: str = Depends(authenticate),
 ):
@@ -122,10 +129,14 @@ def answer_question_get(
 
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
     is a complex task that should be handled with a powerful LLM."""
-    return process_question(request, auth)
+    return await process_question(request, auth)
 
-@router.post('/answerQuestion', response_class = JSONResponse, response_model=answerQuestionResponse, tags = ['Ask a Question'])
-def answer_question_post(
+@router.post(
+        '/answerQuestion',
+        response_class = JSONResponse,
+        response_model=answerQuestionResponse,
+        tags = ['Ask a Question'])
+async def answer_question_post(
     endpoint_request: answerQuestionRequest,
     auth: str = Depends(authenticate),
 ):
@@ -150,13 +161,13 @@ def answer_question_post(
 
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
     is a complex task that should be handled with a powerful LLM."""
-    return process_question(endpoint_request, auth)
+    return await process_question(endpoint_request, auth)
 
-def process_question(request_data: answerQuestionRequest, auth: str):
+async def process_question(request_data: answerQuestionRequest, auth: str):
     """Main function to process the question and return the answer"""
     try:
-        # Right now, not all Denodo instances have permissions implemented. This should be deleted in the future.
-        USER_PERMISSIONS = int(os.getenv("USER_PERMISSIONS", 0))
+        # Generate session ID for Langfuse debugging purposes
+        session_id = generate_session_id(request_data.question)
 
         vector_search_tables, timings = sdk_ai_tools.get_relevant_tables(
             query=request_data.question,
@@ -164,38 +175,42 @@ def process_question(request_data: answerQuestionRequest, auth: str):
             embeddings_model=request_data.embeddings_model,
             vector_store_provider=request_data.vector_store_provider,
             vdb_list=request_data.vdp_database_names,
+            tag_list=request_data.vdp_tag_names,
             auth=auth,
             k=request_data.vector_search_k,
-            user_permissions=USER_PERMISSIONS,
             use_views=request_data.use_views,
             expand_set_views=request_data.expand_set_views
         )
 
         with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = sdk_ai_tools.sql_category(
+            category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
                 query=request_data.question, 
                 vector_search_tables=vector_search_tables, 
                 llm_provider=request_data.chat_provider,
                 llm_model=request_data.chat_model,
                 mode=request_data.mode,
-                custom_instructions=request_data.custom_instructions
+                custom_instructions=request_data.custom_instructions,
+                session_id=session_id
             )
 
         if category == "SQL":
-            response = sdk_answer_question.process_sql_category(
+            response = await sdk_answer_question.process_sql_category(
                 request=request_data, 
                 vector_search_tables=vector_search_tables, 
                 category_response=category_response,
                 auth=auth, 
                 timings=timings,
+                session_id=session_id
             )
+            response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
         elif category == "METADATA":
             response = sdk_answer_question.process_metadata_category(
                 category_response=category_response, 
                 category_related_questions=category_related_questions, 
                 vector_search_tables=vector_search_tables, 
                 disclaimer=request_data.disclaimer,
-                timings=timings
+                tokens=sql_category_tokens,
+                timings=timings,
             )
         else:
             response = sdk_answer_question.process_unknown_category(timings=timings)

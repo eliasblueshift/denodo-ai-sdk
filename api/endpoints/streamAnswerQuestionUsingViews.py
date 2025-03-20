@@ -24,18 +24,19 @@ from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
 router = APIRouter()
-security_basic = HTTPBasic()
-security_bearer = HTTPBearer()
-
-# Get the authentication type from environment
-AUTH_TYPE = os.getenv("DATA_CATALOG_AUTH_TYPE", "http_basic")
-
-if AUTH_TYPE.lower() == "http_basic":
-    def authenticate(credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)]):
-        return (credentials.username, credentials.password)
-else:
-    def authenticate(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]):
-        return credentials.credentials
+security_basic = HTTPBasic(auto_error = False)
+security_bearer = HTTPBearer(auto_error = False)
+    
+def authenticate(
+        basic_credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)],
+        bearer_credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]
+        ):
+    if bearer_credentials is not None:
+        return bearer_credentials.credentials
+    elif basic_credentials is not None:
+        return (basic_credentials.username, basic_credentials.password)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
 class streamAnswerQuestionUsingViewsRequest(BaseModel):
     question: str
@@ -56,8 +57,11 @@ class streamAnswerQuestionUsingViewsRequest(BaseModel):
     disclaimer: bool = True
     verbose: bool = True
 
-@router.post('/streamAnswerQuestionUsingViews', response_class = StreamingResponse, tags = ['Ask a Question - Streaming - Custom Vector Store'])
-def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
+@router.post(
+        '/streamAnswerQuestionUsingViews',
+        response_class = StreamingResponse,
+        tags = ['Ask a Question - Streaming - Custom Vector Store'])
+async def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
     """
     The only difference between this endpoint and `streamAnswerQuestion` is that this endpoint 
     expects the result of the vector search to be passed in as a parameter.
@@ -82,7 +86,7 @@ def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingVi
     try:
         timings = {}
         with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = sdk_ai_tools.sql_category(
+            category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
                 query=endpoint_request.question, 
                 vector_search_tables=endpoint_request.vector_search_tables, 
                 llm_provider=endpoint_request.chat_provider,
@@ -92,7 +96,7 @@ def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingVi
             )
 
         if category == "SQL":
-            response = sdk_answer_question.process_sql_category(
+            response = await sdk_answer_question.process_sql_category(
                 request=endpoint_request, 
                 vector_search_tables=endpoint_request.vector_search_tables, 
                 category_response=category_response,
@@ -100,7 +104,7 @@ def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingVi
                 timings=timings,
             )
         elif category == "METADATA":
-            response = sdk_answer_question.process_metadata_category(
+            response = await sdk_answer_question.process_metadata_category(
                 category_response=category_response, 
                 category_related_questions=category_related_questions, 
                 vector_search_tables=endpoint_request.vector_search_tables, 
@@ -112,12 +116,9 @@ def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingVi
         def generator():
             yield from response.get('answer', 'Error processing the question.')
         return StreamingResponse(generator(), media_type = 'text/plain')
-    
     except Exception as e:
-
         error_details = {
             'error': str(e),
             'traceback': traceback.format_exc()
         }
-
         raise HTTPException(status_code=500, detail=error_details)

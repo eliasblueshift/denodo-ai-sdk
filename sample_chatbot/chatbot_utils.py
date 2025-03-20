@@ -12,16 +12,16 @@ from langchain_community.document_loaders.csv_loader import CSVLoader
 
 def dummy_login(api_host, username, password):
     params = {
-        'vdp_database_names': 'fake_vdb'
+        'vdp_database_names': 'fake_vdb',
+        'vdp_tag_names': 'fake_tag'
     }
     response = requests.get(f'{api_host}/getMetadata', params = params, auth = (username, password), verify=False)
     return response.status_code == 204
 
-def get_relevant_tables(api_host, username, password, query, vdp_database_names):
+def get_relevant_tables(api_host, username, password, query):
     try:
         request_params = {
             'query': query,
-            'vdp_database_names': vdp_database_names,
             'scores': False
         }
         response = requests.get(f'{api_host}/similaritySearch', params=request_params, auth=(username, password), verify=False)
@@ -35,23 +35,34 @@ def get_relevant_tables(api_host, username, password, query, vdp_database_names)
         return True, table_names
     except Exception as e:
         return False, {str(e)}
+    
+def ai_sdk_health_check(api_host):
+    try:
+        response = requests.get(f'{api_host}/health', verify=False)
+        return response.status_code == 200
+    except Exception as e:
+        return False
 
-def connect_to_ai_sdk(api_host, username, password, overwrite=False, examples_per_table=3):
+def connect_to_ai_sdk(api_host, username, password, insert=True, overwrite=False, examples_per_table=3, parallel=True, vdp_database_names = None):
     try:
         request_params = {
-            'insert': True,
+            'insert': insert,
             'overwrite': overwrite,
             'examples_per_table': examples_per_table,
+            'parallel': parallel
         }
+
+        if vdp_database_names is not None:
+            request_params['vdp_database_names'] = vdp_database_names
+
         response = requests.get(f'{api_host}/getMetadata', params=request_params, auth=(username, password), verify=False)
         
         if response.status_code != 200:
-            error_detail = response.text
-            return False, f"Server Error ({response.status_code}): {error_detail}"
+            return False, f"Server Error ({response.status_code}): {response.text}"
 
         data = response.json()
         db_schema = data.get('db_schema_json')
-        vdbs = data.get('vdb_list')
+        vdbs = ','.join(data.get('vdb_list', []))
 
         if db_schema is None:
             return False, "Query didn't fail, but it returned no data. Check the Data Catalog logs."

@@ -11,6 +11,7 @@ import { CSVLink } from "react-csv";
 import Badge from "react-bootstrap/Badge";
 import './Results.css';
 import useSDK from '../hooks/useSDK';
+import { useConfig } from '../contexts/ConfigContext';
 
 const Results = ({ results, setResults }) => {
   const [showModal, setShowModal] = useState(false);
@@ -18,6 +19,7 @@ const Results = ({ results, setResults }) => {
   const resultsEndRef = useRef(null);
   const [showGraphModal, setShowGraphModal] = useState(false);
   const [selectedGraph, setSelectedGraph] = useState(null);
+  const { config } = useConfig();
 
   const { processQuestion } = useSDK(
     setResults
@@ -228,14 +230,48 @@ const Results = ({ results, setResults }) => {
           {sortedTables.map((table, index) => {
             const cleanTable = table.replace(/"/g, '').toLowerCase();
             const isUsedInVql = cleanVql.includes(cleanTable);
+            
+            // Split the table name to get schema and table parts
+            const tableParts = cleanTable.split('.');
+            const schema = tableParts[0];
+            const tableName = tableParts[1] || schema; // If no schema, use the whole name as tableName
+            
+            // Create the URL for the Denodo Data Catalog
+            const catalogUrl = config.dataCatalogUrl ? `${config.dataCatalogUrl}/#/view/${schema}/${tableName}` : null;
+            
             return (
-              <Badge 
-                key={index} 
-                bg={isUsedInVql ? "success" : "secondary"} 
-                className="context-badge me-1 mb-1"
-              >
-                {table.replace(/"/g, '')}
-              </Badge>
+              catalogUrl ? (
+                <a 
+                  key={index}
+                  href={catalogUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-decoration-none"
+                >
+                  <Badge 
+                    bg={isUsedInVql ? "success" : "secondary"} 
+                    className="context-badge me-1 mb-1 d-inline-flex align-items-center"
+                    style={{ cursor: 'pointer' }}
+                  >
+                    <img 
+                      src="view.svg" 
+                      alt="View" 
+                      width="16" 
+                      height="16" 
+                      className="me-1" 
+                    />
+                    {table.replace(/"/g, '')}
+                  </Badge>
+                </a>
+              ) : (
+                <Badge 
+                  key={index}
+                  bg={isUsedInVql ? "success" : "secondary"} 
+                  className="context-badge me-1 mb-1 d-inline-flex align-items-center"
+                >
+                  {table.replace(/"/g, '')}
+                </Badge>
+              )
             );
           })}
         </div>

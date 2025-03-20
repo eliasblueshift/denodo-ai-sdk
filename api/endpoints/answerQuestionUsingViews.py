@@ -20,23 +20,24 @@ from fastapi.encoders import jsonable_encoder
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context
+from api.utils.sdk_utils import timing_context, add_tokens
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
 router = APIRouter()
-security_basic = HTTPBasic()
-security_bearer = HTTPBearer()
-
-# Get the authentication type from environment
-AUTH_TYPE = os.getenv("DATA_CATALOG_AUTH_TYPE", "http_basic")
-
-if AUTH_TYPE.lower() == "http_basic":
-    def authenticate(credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)]):
-        return (credentials.username, credentials.password)
-else:
-    def authenticate(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]):
-        return credentials.credentials
+security_basic = HTTPBasic(auto_error = False)
+security_bearer = HTTPBearer(auto_error = False)
+    
+def authenticate(
+        basic_credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)],
+        bearer_credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]
+        ):
+    if bearer_credentials is not None:
+        return bearer_credentials.credentials
+    elif basic_credentials is not None:
+        return (basic_credentials.username, basic_credentials.password)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
 class answerQuestionUsingViewsRequest(BaseModel):
     question: str
@@ -71,7 +72,11 @@ class answerQuestionUsingViewsResponse(BaseModel):
     llm_time: float
     total_execution_time: float
 
-@router.post('/answerQuestionUsingViews', response_class = JSONResponse, response_model = answerQuestionUsingViewsResponse, tags = ['Ask a Question - Custom Vector Store'])
+@router.post(
+        '/answerQuestionUsingViews',
+        response_class = JSONResponse,
+        response_model = answerQuestionUsingViewsResponse,
+        tags = ['Ask a Question - Custom Vector Store'])
 def answerQuestionUsingViews(endpoint_request: answerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
     """
     The only difference between this endpoint and `answerQuestion` is that this endpoint 
@@ -114,11 +119,13 @@ def answerQuestionUsingViews(endpoint_request: answerQuestionUsingViewsRequest, 
                 auth=auth, 
                 timings=timings
             )
+            response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
         elif category == "METADATA":
             response = sdk_answer_question.process_metadata_category(
                 category_response=category_response, 
                 category_related_questions=category_related_questions, 
                 vector_search_tables=endpoint_request.vector_search_tables, 
+                tokens=sql_category_tokens,
                 timings=timings
             )
         else:

@@ -1,11 +1,20 @@
 import os
 import re
 import sys
+import random
 import logging
 import requests
 
 from time import time
 from contextlib import contextmanager
+
+def add_tokens(token_set1, token_set2):
+    return {key: token_set1[key] + token_set2[key] for key in token_set1}
+
+def generate_session_id(question):
+    question_prefix = ''.join(c for c in question[:20] if c.isalpha() or c.isspace())
+    question_prefix = question_prefix.replace(' ', '_')
+    return f"{question_prefix}_{random.randint(1000,9999)}"
 
 @contextmanager
 def timing_context(name, timings):
@@ -26,7 +35,7 @@ def readable_tables(relevant_tables):
     for table in relevant_tables:
         table_schema = table['view_json']['schema']
         table_columns = [column['columnName'] for column in table_schema]
-        readable_output += f'Table {table["view_name"]} with columns {",".join(table_columns)}\n'
+        readable_output += f'<table>Table {table["view_name"]} with columns {", ".join(table_columns)}\n</table>\n'
     
     return readable_output
 
@@ -127,7 +136,6 @@ def prepare_vql(vql):
         'DATE_TRUNC',
         'INTERVAL',
         'ADDDATE',
-        'LEFT',
         'TO_CHAR',
         'LPAD',
         'STRING_AGG',
@@ -190,12 +198,6 @@ def get_response_format(markdown_response):
     else:
         response_format = "- Use plain text to answer, don't use markdown or any other formatting."
         response_example = "Cristiano Ronaldo was the player who scored the most goals last year, with a total of 23 goals."
-
-    response_example += """
-        <related_question>How many goals did the top three players score last year?</related_question>
-        <related_question>Which player had the most assists last year?</related_question>
-        <related_question>What was the average number of goals scored by the top five players?</related_question>
-    """
     return response_format, response_example
 
 def check_env_variables(required_vars):

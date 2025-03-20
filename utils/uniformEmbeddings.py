@@ -1,7 +1,9 @@
 import os
 import logging
 
+from langchain.storage import LocalFileStore
 from utils.utils import RefreshableBotoSession
+from langchain.embeddings import CacheBackedEmbeddings
 
 class UniformEmbeddings:
     VALID_PROVIDERS = [
@@ -19,9 +21,8 @@ class UniformEmbeddings:
         self.provider_name = provider_name
         self.model_name = model_name
         self.model = None
-
-        if self.provider_name is None:
-            raise ValueError("Provider name not set.")
+        self.store = LocalFileStore("./cache/embeddings/")
+        self.base_embeddings = None
 
         if self.provider_name.lower() not in list(map(str.lower, self.VALID_PROVIDERS)):
             logging.warning(f"Provider '{self.provider_name}' not in standard list. Creating custom OpenAI-compatible provider.")
@@ -49,6 +50,13 @@ class UniformEmbeddings:
         elif self.provider_name.lower() == "googleaistudio":
             self.setup_google_ai_studio()
 
+        self.model = CacheBackedEmbeddings.from_bytes_store(
+            self.base_embeddings,
+            self.store,
+            namespace=self.model_name,
+            query_embedding_cache=True,
+        )
+
     def setup_google_ai_studio(self):
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
@@ -56,7 +64,7 @@ class UniformEmbeddings:
         if api_key is None:
             raise ValueError("GOOGLE_AI_STUDIO_API_KEY environment variable not set.")
         
-        self.model = GoogleGenerativeAIEmbeddings(
+        self.base_embeddings = GoogleGenerativeAIEmbeddings(
             model=self.model_name,
             google_api_key=api_key
         )
@@ -67,9 +75,9 @@ class UniformEmbeddings:
         base_url = os.getenv('OLLAMA_API_BASE_URL')
         
         if base_url:
-            self.model = OllamaEmbeddings(model = self.model_name, base_url = base_url)
+            self.base_embeddings = OllamaEmbeddings(model = self.model_name, base_url = base_url)
         else:
-            self.model = OllamaEmbeddings(model = self.model_name)
+            self.base_embeddings = OllamaEmbeddings(model = self.model_name)
 
     def setup_nvidia(self):
         from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
@@ -88,7 +96,7 @@ class UniformEmbeddings:
         if base_url is not None:
             kwargs["base_url"] = base_url
 
-        self.model = NVIDIAEmbeddings(**kwargs)
+        self.base_embeddings = NVIDIAEmbeddings(**kwargs)
 
     def setup_google(self):
         from langchain_google_vertexai import VertexAIEmbeddings
@@ -97,7 +105,7 @@ class UniformEmbeddings:
         if api_key is None:
             raise ValueError("GOOGLE_APPLICATION_CREDENTIALS environment variable not set.")
 
-        self.model = VertexAIEmbeddings(model_name = self.model_name)
+        self.base_embeddings = VertexAIEmbeddings(model_name = self.model_name)
 
     def setup_openai(self):
         from langchain_openai import OpenAIEmbeddings
@@ -129,7 +137,7 @@ class UniformEmbeddings:
         if dimensions is not None:
             kwargs["dimensions"] = int(dimensions)
 
-        self.model = OpenAIEmbeddings(**kwargs)
+        self.base_embeddings = OpenAIEmbeddings(**kwargs)
 
     def setup_azure_openai(self):
         from langchain_openai import AzureOpenAIEmbeddings
@@ -166,7 +174,7 @@ class UniformEmbeddings:
         if dimensions is not None:
             kwargs["dimensions"] = int(dimensions)
 
-        self.model = AzureOpenAIEmbeddings(**kwargs)
+        self.base_embeddings = AzureOpenAIEmbeddings(**kwargs)
 
     def setup_bedrock(self):
         from langchain_aws import BedrockEmbeddings
@@ -192,7 +200,7 @@ class UniformEmbeddings:
 
         client = session.client('bedrock-runtime')
 
-        self.model = BedrockEmbeddings(
+        self.base_embeddings = BedrockEmbeddings(
             client = client,
             model_id = self.model_name
         )
@@ -204,7 +212,7 @@ class UniformEmbeddings:
         if api_key is None:
             raise ValueError("MISTRAL_API_KEY environment variable not set.")
 
-        self.model = MistralAIEmbeddings(model = self.model_name, mistral_api_key = api_key)
+        self.base_embeddings = MistralAIEmbeddings(model = self.model_name, mistral_api_key = api_key)
 
     def setup_custom(self):
         from langchain_openai import OpenAIEmbeddings
@@ -229,4 +237,4 @@ class UniformEmbeddings:
         if proxy is not None:
             kwargs["openai_proxy"] = proxy
 
-        self.model = OpenAIEmbeddings(**kwargs)
+        self.base_embeddings = OpenAIEmbeddings(**kwargs)

@@ -1,10 +1,11 @@
 import inspect
 import traceback
 import logging
+import random
 
 from utils.utils import add_langfuse_callback, generate_langfuse_session_id, custom_tag_parser
 from langchain_core.output_parsers import StrOutputParser
-from sample_chatbot.chatbot_utils import process_tool_query, add_to_chat_history, get_relevant_tables, readable_tool_result, parse_xml_tags
+from sample_chatbot.chatbot_utils import process_tool_query, add_to_chat_history, readable_tool_result, parse_xml_tags
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 RELATED_QUESTIONS_PROMPT = """
@@ -13,7 +14,7 @@ The questions should be closely related to the current conversation and should n
 - Return each related question in between <related_question></related_question> tags. I will now answer:"""
 
 class ChatbotEngine:
-    def __init__(self, llm, system_prompt, tool_selection_prompt, tools, api_host, username, password, vdp_database_names, vector_store_provider, message_history = 4):
+    def __init__(self, llm, system_prompt, tool_selection_prompt, tools, api_host, username, password, vector_store_provider, denodo_tables, message_history = 4):
         self.llm = llm.llm
         self.llm_callback = llm.callback
         self.llm_model = f"{llm.provider_name}.{llm.model_name}"
@@ -27,7 +28,8 @@ class ChatbotEngine:
         self.api_host = api_host
         self.username = username
         self.password = password
-        self.vdp_database_names = vdp_database_names
+        self.wait_phrases = ["Give me a second", "Please wait", "Hold on", "Just a moment", "I'm working on it", "I'm looking into it", "I'm checking it out", "I'm on it"]
+        self.denodo_tables = denodo_tables
         self.tools_prompt = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
             MessagesPlaceholder("chat_history", n_messages=self.message_history),
@@ -51,7 +53,7 @@ class ChatbotEngine:
             | self.llm
             | StrOutputParser()
         )
-
+        
     def process_query(self, query, tool = None):
         if tool == "data":
             tool = "database_query"
@@ -60,24 +62,12 @@ class ChatbotEngine:
         else:
             tool = None
         try:
-            result, relevant_tables = get_relevant_tables(
-                self.api_host,
-                self.username,
-                self.password,
-                query,
-                self.vdp_database_names
-            )
-            if result and relevant_tables:
-                denodo_tables = "Some of the tables in the user's Denodo instance: " + ", ".join(relevant_tables) + "... Use the Metadata tool to query all."
-            else:
-                denodo_tables = "No views where found in the user's Denodo instance. Either the user has no views, the connection is not working or he does not have enough permissions. Use the Metadata tool to check."
-
             force_tool = f"In this case, I will use tool {tool}..." if tool else ""
             first_input = self.tool_selection_chain.invoke(
                 {"input": query,
                  "chat_history": self.chat_history,
                  "force_tool": force_tool,
-                 "denodo_tables": denodo_tables},
+                 "denodo_tables": self.denodo_tables},
                 config={
                     "callbacks": add_langfuse_callback(self.llm_callback, self.llm_model, self.session_id),
                     "run_name": inspect.currentframe().f_code.co_name,
@@ -92,11 +82,11 @@ class ChatbotEngine:
                         if tool_name == "database_query":
                             natural_language_query = parsed_query["database_query"]["natural_language_query"]
                             yield "<TOOL:data>"
-                            yield f"Querying Denodo for: **{natural_language_query}**. Give me a second.\n\n"
+                            yield f"Querying Denodo for: **{natural_language_query}**. {random.choice(self.wait_phrases)}.\n\n"
                         elif tool_name == "metadata_query":
                             search_query = parsed_query["metadata_query"]["search_query"]
                             yield "<TOOL:metadata>"
-                            yield f"Querying Denodo for: **{search_query}**. Give me a second.\n\n"
+                            yield f"Querying Denodo for: **{search_query}**. {random.choice(self.wait_phrases)}.\n\n"
                         elif tool_name == "kb_lookup":
                             yield "<TOOL:kb>"
                         else:
@@ -107,13 +97,12 @@ class ChatbotEngine:
             tool_result = process_tool_query(first_input, self.tools)
             if tool_result:
                 tool_name, tool_output, original_xml_call = tool_result
-
                 readable_tool_output = readable_tool_result(tool_name, tool_output)
                 ai_stream = self.answer_with_tool_chain.stream({
                     "input": query,
                     "chat_history": self.chat_history,
                     "tool_query": readable_tool_output,
-                    "denodo_tables": denodo_tables,
+                    "denodo_tables": self.denodo_tables,
                 },
                 config = {
                     "callbacks": add_langfuse_callback(self.llm_callback, self.llm_model, self.session_id),

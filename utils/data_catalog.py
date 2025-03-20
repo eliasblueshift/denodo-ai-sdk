@@ -28,14 +28,14 @@ EXECUTE_VQL_LIMIT = 100
 
 @timed
 def get_views_metadata_documents(
-    database_name,
     auth,
+    tag_name=None,
+    database_name=None,
     examples_per_table=3,
     table_associations=True,
     table_descriptions=True,
     table_column_descriptions=True,
     filter_tables=None,
-    data_mode='DATABASE',
     server_id=DATA_CATALOG_SERVER_ID,
     verify_ssl=DATA_CATALOG_VERIFY_SSL,
     metadata_url=DATA_CATALOG_METADATA_URL
@@ -45,13 +45,14 @@ def get_views_metadata_documents(
     Handles both legacy and paginated API versions automatically.
     
     Args:
-        database_name: Name of the database to query
+        database_name: Name of the database to query (mutually exclusive with tag_name)
         auth: Either (username, password) tuple for basic auth or OAuth token string
         examples_per_table: Number of example rows to fetch per table (0 to disable)
         table_associations: Whether to include table associations
         table_descriptions: Whether to include descriptions
+        table_column_descriptions: Whether to include column descriptions
         filter_tables: List of tables to exclude (default: None)
-        data_mode: Mode of data retrieval (default: 'DATABASE')
+        tag_name: Name of the tag to query (mutually exclusive with database_name)
         server_id: Server identifier
         verify_ssl: Whether to verify SSL certificates (default: DATA_CATALOG_VERIFY_SSL)
         metadata_url: Data Catalog metadata URL (default: DATA_CATALOG_METADATA_URL)
@@ -59,14 +60,29 @@ def get_views_metadata_documents(
     Returns:
         Parsed metadata JSON response
     """
-    logging.info(f"Starting to retrieve views metadata with {examples_per_table} examples per view on {database_name}")
+    # Validate that only one of database_name or tag_name is provided
+    if (database_name is None and tag_name is None) or (database_name is not None and tag_name is not None):
+        raise ValueError("Exactly one of database_name or tag_name must be provided")
+    
+    # Set data_mode based on which parameter is provided
+    data_mode = 'DATABASE' if database_name is not None else 'TAG'
+    
+    # Set the appropriate logging message based on which parameter is provided
+    entity_name = database_name if database_name is not None else tag_name
+    entity_type = "database" if database_name is not None else "tag"
+    logging.info(f"Starting to retrieve views metadata with {examples_per_table} examples per view on {entity_type} '{entity_name}'")
     
     def prepare_request_data(offset=None, limit=None):
         data = {
             "dataMode": data_mode,
-            "databaseName": database_name,
             "dataUsage": examples_per_table > 0,
         }
+        
+        # Add the appropriate parameter based on data_mode
+        if data_mode == 'DATABASE':
+            data["databaseName"] = database_name
+        else:  # data_mode == 'TAG'
+            data["tagName"] = tag_name
         
         if examples_per_table > 0:
             data["dataUsageConfiguration"] = {
@@ -116,7 +132,7 @@ def get_views_metadata_documents(
     try:
         # Initial request without pagination to detect DC API version
         initial_response = make_request(prepare_request_data())
-        logging.info(f"Initial response: {initial_response}")
+        
         # If it's not a list, it's the old DC API (<9.1.0)
         if not isinstance(initial_response, list):
             views = initial_response.get('viewsDetails', initial_response)
@@ -213,19 +229,24 @@ def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CATALOG_E
         response.raise_for_status()
 
         json_response = response.json()
+        
+        # Check for empty results in multiple scenarios
         if not json_response.get('rows'):
-            logging.info("Query returned no rows")
-            return 499, None
-
+            logging.info("Query returned no results.")
+            return 499, "Query executed succesfully but returned an empty result (no rows)."
+        elif (len(json_response['rows']) == 1 and  # Single row
+            len(json_response['rows'][0]['values']) == 1 and  # Single column
+            (str(json_response['rows'][0]['values'][0]['value']) == '0' or  # Value is 0
+             json_response['rows'][0]['values'][0]['value'] is None)):  # Value is null/None
+            logging.info("Query returned only one row, one column with a value of 0 or null")
+            return 499, f"Query executed succesfully but returned a single row with a value of 0 or null: {parse_execution_json(json_response)}"
         logging.info("Query executed successfully")
         return response.status_code, parse_execution_json(json_response)
-
     except requests.HTTPError as e:
         error_response = json.loads(e.response.text)
         error_message = parse_execution_error(error_response.get('message', 'Data Catalog did not return further details'))
         logging.error(f"Data Catalog execute VQL failed: {error_message}")
         return e.response.status_code, error_message
-
     except requests.RequestException as e:
         error_message = f"Failed to connect to the server: {str(e)}"
         logging.error(f"{error_message}. VQL: {vql}")
@@ -234,8 +255,9 @@ def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CATALOG_E
 @log_params
 @timed
 def get_allowed_view_ids(
-    database_names,
     auth,
+    database_names=None,
+    tag_names=None,
     server_id=DATA_CATALOG_SERVER_ID,
     permissions_url=DATA_CATALOG_PERMISSIONS_URL,
     verify_ssl=DATA_CATALOG_VERIFY_SSL
@@ -246,6 +268,7 @@ def get_allowed_view_ids(
     Args:
         auth: Either (username, password) tuple for basic auth or OAuth token string
         database_names: List of database names to query
+        tag_names: List of tag names to query
         server_id: The server ID (default is DATA_CATALOG_SERVER_ID)
         permissions_url: The Data Catalog permissions URL
         verify_ssl: Whether to verify SSL certificates
@@ -265,11 +288,15 @@ def get_allowed_view_ids(
         )
     }
 
-    def fetch_view_ids(db_name):
+    def fetch_view_ids(name, type = 'DATABASE'):
         data = {
-            "dataMode": "DATABASE",
-            "databaseNames": [db_name]
+            "dataMode": type,
         }
+        if type == 'DATABASE':
+            data["databaseNames"] = [name]
+        else:
+            data["tagNames"] = [name]
+
         try:
             response = requests.post(
                 f"{permissions_url}?serverId={server_id}",
@@ -281,22 +308,25 @@ def get_allowed_view_ids(
             view_ids = response.json()
             
             if not isinstance(view_ids, list) or not all(isinstance(id, int) for id in view_ids):
-                raise ValueError(f"Unexpected response format for {db_name}: not a list of integers")
+                raise ValueError(f"Unexpected response format for {name}: not a list of integers")
             
             return view_ids
         except (requests.RequestException, ValueError) as e:
-            logging.error(f"Failed to retrieve allowed view IDs for {db_name}: {str(e)}")
+            logging.error(f"Failed to retrieve allowed view IDs for {name}: {str(e)}")
             return None
 
     # Use ThreadPoolExecutor for concurrent requests
     allowed_view_ids = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(fetch_view_ids, db) for db in database_names]
+        futures = [executor.submit(fetch_view_ids, db, 'DATABASE') for db in database_names]
+        futures.extend([executor.submit(fetch_view_ids, tag, 'TAG') for tag in tag_names])
+
         for future in concurrent.futures.as_completed(futures):
             if view_ids := future.result():
                 allowed_view_ids.extend(view_ids)
 
-    return allowed_view_ids
+    unique_view_ids = list(set(allowed_view_ids))
+    return unique_view_ids
 
 # This method calculates the authorization header for the Data Catalog REST API
 def calculate_basic_auth_authorization_header(user, password):
@@ -338,17 +368,17 @@ def parse_metadata_json(json_response, use_associations = True, use_descriptions
                 'description': json_table.get('description', ""),
             }
 
-            example_data_dict = {}
+            sample_data_dict = {}
             for example in json_table['viewFieldDataList']:
-                    example_data_dict[example['fieldName']] = example['fieldValues']
+                    sample_data_dict[example['fieldName']] = example['fieldValues']
 
             # Combine the example data with the schema
             for field in json_table['schema']:
                 field_name = field['name']
-                if field_name in example_data_dict:
-                    field['example_data'] = example_data_dict[field_name]
+                if field_name in sample_data_dict:
+                    field['sample_data'] = sample_data_dict[field_name]
                 else:
-                    field['example_data'] = []
+                    field['sample_data'] = []
         else:
             output_table = {
                 'tableName': table_name,
@@ -365,7 +395,7 @@ def parse_metadata_json(json_response, use_associations = True, use_descriptions
         for i, item in enumerate(json_table['schema']):
             column_name = {'columnName': item['name']}
             item.pop('name')
-            if use_column_descriptions == False:
+            if not use_column_descriptions:
                 if 'logicalName' in item:
                     item.pop('logicalName')
                 if 'description' in item:

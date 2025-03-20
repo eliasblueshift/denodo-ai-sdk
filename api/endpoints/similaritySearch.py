@@ -25,22 +25,24 @@ from utils.uniformVectorStore import UniformVectorStore
 from api.utils.sdk_utils import filter_non_allowed_associations
 
 router = APIRouter()
-security_basic = HTTPBasic()
-security_bearer = HTTPBearer()
-
-# Get the authentication type from environment
-AUTH_TYPE = os.getenv("DATA_CATALOG_AUTH_TYPE", "http_basic")
-
-if AUTH_TYPE.lower() == "http_basic":
-    def authenticate(credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)]):
-        return (credentials.username, credentials.password)
-else:
-    def authenticate(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]):
-        return credentials.credentials
+security_basic = HTTPBasic(auto_error = False)
+security_bearer = HTTPBearer(auto_error = False)
+    
+def authenticate(
+        basic_credentials: Annotated[HTTPBasicCredentials, Depends(security_basic)],
+        bearer_credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_bearer)]
+        ):
+    if bearer_credentials is not None:
+        return bearer_credentials.credentials
+    elif basic_credentials is not None:
+        return (basic_credentials.username, basic_credentials.password)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
 class similaritySearchRequest(BaseModel):
     query: str
-    vdp_database_names: str = os.getenv('VDB_NAMES')
+    vdp_database_names: str = os.getenv('VDB_NAMES', '')
+    vdp_tag_names: str = os.getenv('VDB_TAGS', '')
     embeddings_provider: str = os.getenv('EMBEDDINGS_PROVIDER')
     embeddings_model: str = os.getenv('EMBEDDINGS_MODEL')
     vector_store_provider: str = os.getenv('VECTOR_STORE')
@@ -50,7 +52,11 @@ class similaritySearchRequest(BaseModel):
 class similaritySearchResponse(BaseModel):
     views: List[str]
 
-@router.get("/similaritySearch", response_class = JSONResponse, response_model = similaritySearchResponse, tags = ['Vector Store'])
+@router.get(
+        '/similaritySearch',
+        response_class = JSONResponse,
+        response_model = similaritySearchResponse,
+        tags = ['Vector Store'])
 def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth: str = Depends(authenticate)):
     """
     This endpoint performs a similarity search on the vector database specified in the request.
@@ -58,27 +64,30 @@ def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth
     using getMetadata endpoint.
     """
     try:
-        # Right now, not all Denodo instances have permissions implemented. This should be deleted in the future.
-        USER_PERMISSIONS = int(os.getenv("USER_PERMISSIONS", 0))
+        vdp_database_names = [db.strip() for db in endpoint_request.vdp_database_names.split(',')] if endpoint_request.vdp_database_names else []
+        vdp_tag_names = [tag.strip() for tag in endpoint_request.vdp_tag_names.split(',')] if endpoint_request.vdp_tag_names else []
 
-        vdp_database_names = [db.strip() for db in endpoint_request.vdp_database_names.split(',')]
         vector_store = UniformVectorStore(
             provider=endpoint_request.vector_store_provider,
             embeddings_provider=endpoint_request.embeddings_provider,
             embeddings_model=endpoint_request.embeddings_model,
         )
 
+        if not vdp_database_names and not vdp_tag_names:
+            vdp_database_names = vector_store.get_database_names()
+            vdp_tag_names = vector_store.get_tag_names()
+
         search_params = {
             "query": endpoint_request.query,
             "k": endpoint_request.n_results,
             "scores": endpoint_request.scores,
-            "database_names": vdp_database_names
+            "database_names": vdp_database_names,
+            "tag_names": vdp_tag_names
         }
 
-        if USER_PERMISSIONS:
-            valid_view_ids = get_allowed_view_ids(auth = auth, database_names = vdp_database_names)
-            valid_view_ids = [str(view_id) for view_id in valid_view_ids]
-            search_params["view_ids"] = valid_view_ids
+        valid_view_ids = get_allowed_view_ids(auth = auth, database_names = vdp_database_names, tag_names = vdp_tag_names)
+        valid_view_ids = [str(view_id) for view_id in valid_view_ids]
+        search_params["view_ids"] = valid_view_ids
 
         search_results = vector_store.search(**search_params)
 
@@ -90,11 +99,11 @@ def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth
                         filter_non_allowed_associations(
                             json.loads((result[0] if endpoint_request.scores else result).metadata["view_json"]),
                             valid_view_ids
-                        ) if USER_PERMISSIONS else 
-                        json.loads((result[0] if endpoint_request.scores else result).metadata["view_json"])
+                        )
                     ),
                     "view_text": (result[0] if endpoint_request.scores else result).page_content,
                     "database_name": (result[0] if endpoint_request.scores else result).metadata["database_name"],
+                    "tag_names": (result[0] if endpoint_request.scores else result).metadata["tag_names"],
                     **({"scores": result[1]} if endpoint_request.scores else {})
                 } for result in search_results
             ]
