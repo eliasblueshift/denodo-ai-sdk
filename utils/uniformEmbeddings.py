@@ -50,12 +50,15 @@ class UniformEmbeddings:
         elif self.provider_name.lower() == "googleaistudio":
             self.setup_google_ai_studio()
 
-        self.model = CacheBackedEmbeddings.from_bytes_store(
-            self.base_embeddings,
-            self.store,
-            namespace=self.model_name,
-            query_embedding_cache=True,
-        )
+        if ":" in self.model_name:
+            self.model = self.base_embeddings
+        else:
+            self.model = CacheBackedEmbeddings.from_bytes_store(
+                self.base_embeddings,
+                self.store,
+                namespace=self.model_name,
+                query_embedding_cache=True,
+            )
 
     def setup_google_ai_studio(self):
         from langchain_google_genai import GoogleGenerativeAIEmbeddings

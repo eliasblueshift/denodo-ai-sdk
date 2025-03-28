@@ -162,7 +162,7 @@ def format_schema_text(vector_search_tables, filtered_tables):
         if not nullable:
             flags.append("NOT NULL")
 
-        parts = [f"  {name} ({col_type})"]
+        parts = [f"→ {name} ({col_type})"]
         if flags:
             parts.append(f"[{' '.join(flags)}]")
         if desc:
@@ -175,10 +175,15 @@ def format_schema_text(vector_search_tables, filtered_tables):
     def format_table(table):
         lines = []
         table_name = table.get('tableName', 'unnamed_database.unnamed_table')
+        table_description = table.get('description', '')
         database_name, view_name = table_name.split('.')
         table_name = f'"{database_name}"."{view_name}"'
-        lines.append(f"# {table_name}")
+        lines.append(f"# Table: {table_name}")
 
+        if table_description:
+            lines.append(f"## Description:\n{table_description}")
+
+        lines.append("## Columns:")
         # Format columns
         schema = table.get('schema', [])
         for col in schema:
@@ -187,11 +192,11 @@ def format_schema_text(vector_search_tables, filtered_tables):
         # Format associations
         associations = table.get('associations', [])
         if associations:
-            lines.append("\n  → Joins:")
+            lines.append("## Joins:")
             for assoc in associations:
                 where_clause = assoc.get('where')
                 if where_clause:
-                    lines.append(f"    {where_clause}")
+                    lines.append(f"→ {where_clause}")
 
         return "\n".join(lines)
 

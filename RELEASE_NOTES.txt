@@ -1,4 +1,13 @@
+version 0.6.1 - 20250328
+------------------------
+
+## MAIN CHANGES
+
+- Fixed bug where embedding models with a ":" in the name made the cache crash
+- Fixed bug where the view description would not be sent to the LLM
+
 version 0.6 - 20250318
+------------------------
 
 ## MAIN CHANGES
 
