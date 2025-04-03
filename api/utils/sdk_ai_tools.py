@@ -70,7 +70,7 @@ async def generate_view_answer(query, vql_query, vql_execution_result, llm_provi
     
 @utils.log_params
 @utils.timed
-def query_to_vql(query, vector_search_tables, llm_provider, llm_model, filter_params = '', custom_instructions = '', session_id = None):
+async def query_to_vql(query, vector_search_tables, llm_provider, llm_model, filter_params = '', custom_instructions = '', session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
     prompt = PromptTemplate.from_template(QUERY_TO_VQL_PROMPT)
     query = re.sub(r'(?i)sql', 'VQL', query)
@@ -95,7 +95,7 @@ def query_to_vql(query, vector_search_tables, llm_provider, llm_model, filter_pa
         ARITHMETIC_VQL_PROMPT,
     )
 
-    response = chain.invoke(
+    response = await chain.ainvoke(
         {
             "query": query,
             "schema": relevant_tables,
@@ -437,7 +437,8 @@ async def graph_generator(query, data_file, execution_result, llm_provider, llm_
     python_code = utils.custom_tag_parser(response, 'python', default = '')[0].strip()
 
     python_repl = PythonREPL()
-    output = python_repl.run(python_code)
+    # Run the synchronous PythonREPL in a separate thread
+    output = await asyncio.to_thread(python_repl.run, python_code)
 
     # Check if the \n at the end of the string and remove it
     if output.endswith("\n"):
@@ -447,7 +448,7 @@ async def graph_generator(query, data_file, execution_result, llm_provider, llm_
 
 @utils.log_params
 @utils.timed
-def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, error_log=False, error_categories=[], fixer_history=[], session_id = None):
+async def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, error_log=False, error_categories=[], fixer_history=[], session_id = None):
     llm = UniformLLM(llm_provider, llm_model)
     
     if not error_log:
@@ -464,7 +465,7 @@ def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, 
     final_prompt = PromptTemplate.from_template(prompt)
     final_chain = final_prompt | llm.llm | StrOutputParser()
 
-    response = final_chain.invoke(
+    response = await final_chain.ainvoke(
         parameters, 
         config = {
             "callbacks": utils.add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
@@ -484,7 +485,7 @@ def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, 
 
 @utils.log_params
 @utils.timed
-def query_reviewer(question, vql_query, llm_provider, llm_model, vector_search_tables, session_id = None, fixer_history=[]):
+async def query_reviewer(question, vql_query, llm_provider, llm_model, vector_search_tables, session_id = None, fixer_history=[]):
     llm = UniformLLM(llm_provider, llm_model)
     final_prompt = PromptTemplate.from_template(QUERY_REVIEWER_PROMPT)
     final_chain = final_prompt | llm.llm | StrOutputParser()
@@ -503,7 +504,7 @@ def query_reviewer(question, vql_query, llm_provider, llm_model, vector_search_t
 
     vql_rules = f"Here are the VQL generation rules:\n<vql_rules>\n{vql_restrictions}\n</vql_rules>"
 
-    response = final_chain.invoke(
+    response = await final_chain.ainvoke(
         {
             "question": question,
             "vql_restrictions": '',
@@ -563,7 +564,7 @@ def _get_prompt_and_parameters(question, vql_query, error_log, error_categories,
 
 @utils.log_params
 @utils.timed
-def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_store_provider, vdb_list, tag_list,auth, k = 5, use_views = '', expand_set_views = True):
+async def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_store_provider, vdb_list, tag_list,auth, k = 5, use_views = '', expand_set_views = True):
     vdb_list = [db.strip() for db in vdb_list.split(',')] if vdb_list else []
     tag_list = [tag.strip() for tag in tag_list.split(',')] if tag_list else []
     
@@ -579,7 +580,7 @@ def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_sto
         vdb_list = vector_store.get_database_names()
         tag_list = vector_store.get_tag_names()
     
-    embedded_query = vector_store.embeddings.embed_query(query)
+    embedded_query = await vector_store.embeddings.aembed_query(query)
     search_params = {
         "vector": embedded_query,
         "k": k,
@@ -588,7 +589,7 @@ def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_sto
         "tag_names": tag_list
     }
 
-    valid_view_ids = get_allowed_view_ids(auth = auth, database_names = vdb_list, tag_names = tag_list)
+    valid_view_ids = await get_allowed_view_ids(auth = auth, database_names = vdb_list, tag_names = tag_list)
     valid_view_ids = [str(view_id) for view_id in valid_view_ids]
     search_params["view_ids"] = valid_view_ids
 

@@ -57,7 +57,7 @@ class similaritySearchResponse(BaseModel):
         response_class = JSONResponse,
         response_model = similaritySearchResponse,
         tags = ['Vector Store'])
-def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth: str = Depends(authenticate)):
+async def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth: str = Depends(authenticate)):
     """
     This endpoint performs a similarity search on the vector database specified in the request.
     The vector store MUST have been previously populated with the metadata of the views in the vector database
@@ -85,7 +85,7 @@ def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth
             "tag_names": vdp_tag_names
         }
 
-        valid_view_ids = get_allowed_view_ids(auth = auth, database_names = vdp_database_names, tag_names = vdp_tag_names)
+        valid_view_ids = await get_allowed_view_ids(auth = auth, database_names = vdp_database_names, tag_names = vdp_tag_names)
         valid_view_ids = [str(view_id) for view_id in valid_view_ids]
         search_params["view_ids"] = valid_view_ids
 

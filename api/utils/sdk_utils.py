@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import random
+import uvicorn
 import logging
 import requests
 
@@ -231,3 +232,35 @@ def filter_non_allowed_associations(view_json, valid_view_ids):
     ]
     
     return filtered_view_json
+
+def configure_uvicorn_logging():
+    """Configure Uvicorn's logging to use our format."""
+    log_config = uvicorn.config.LOGGING_CONFIG
+    timestamp_fmt = "%(asctime)s [Worker %(process)d] %(levelname)-8s %(message)s"
+    date_fmt = "%Y-%m-%d %H:%M:%S"
+
+    # Update all formatters
+    for formatter in log_config["formatters"].values():
+        formatter["fmt"] = timestamp_fmt
+        formatter["datefmt"] = date_fmt
+
+    # The access formatter needs special handling to preserve request information
+    log_config["formatters"]["access"]["fmt"] = "%(asctime)s [Worker %(process)d] %(levelname)-8s %(client_addr)s - \"%(request_line)s\" %(status_code)s"
+    
+    # Set up a custom filter to only allow INFO level logs
+    class InfoOnlyFilter(logging.Filter):
+        def filter(self, record):
+            return record.levelno == logging.INFO
+
+    # Apply the filter to all handlers
+    for handler in log_config["handlers"].values():
+        handler["filters"] = ["info_only"]
+    
+    # Add the filter to the filters section
+    log_config["filters"] = {
+        "info_only": {
+            "()": InfoOnlyFilter,
+        }
+    }
+
+    return log_config

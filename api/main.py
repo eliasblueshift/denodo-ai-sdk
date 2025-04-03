@@ -4,7 +4,6 @@ import logging
 import uvicorn
 import warnings
 import platform
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -12,7 +11,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.utils import sdk_config_loader
-from api.utils.sdk_utils import check_env_variables, test_data_catalog_connection
+from api.utils.sdk_utils import check_env_variables, test_data_catalog_connection, configure_uvicorn_logging
 from api.endpoints import (
     getMetadata,
     similaritySearch,
@@ -21,7 +20,7 @@ from api.endpoints import (
     answerQuestion,
     answerQuestionUsingViews,
     answerDataQuestion,
-    answerMetadataQuestion
+    answerMetadataQuestion,
 )
 
 required_vars = [
@@ -54,13 +53,16 @@ check_env_variables(required_vars)
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
-    format='%(asctime)s %(levelname)-8s %(message)s',
+    format='%(asctime)s [Worker %(process)d] %(levelname)-8s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     encoding='utf-8'
 )
 
+log_config = configure_uvicorn_logging()
+
 AI_SDK_HOST = os.getenv("AI_SDK_HOST", "0.0.0.0")
 AI_SDK_PORT = int(os.getenv("AI_SDK_PORT", 8008))
+AI_SDK_WORKERS = int(os.getenv("AI_SDK_WORKERS", '1'))
 AI_SDK_VERSION = os.getenv("AI_SDK_VER")
 AI_SDK_SSL_KEY = os.getenv("AI_SDK_SSL_KEY")
 AI_SDK_SSL_CERT = os.getenv("AI_SDK_SSL_CERT")
@@ -78,12 +80,13 @@ AI_SDK_DATA_CATALOG_VERIFY_SSL = bool(int(os.getenv("DATA_CATALOG_VERIFY_SSL", 0
 # Set this for the tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def log_ai_sdk_parameters():
+    """Log AI SDK parameters and data catalog connection status."""
     ai_sdk_params = {
         "OS": platform.platform(),
         "AI SDK Host": AI_SDK_HOST,
         "AI SDK Port": AI_SDK_PORT,
+        "AI SDK Workers": AI_SDK_WORKERS,
         "AI SDK Version": AI_SDK_VERSION,
         "Using SSL": bool(AI_SDK_SSL_KEY and AI_SDK_SSL_CERT),
         "Chat Provider": AI_SDK_CHAT_PROVIDER,
@@ -105,8 +108,8 @@ async def lifespan(app: FastAPI):
 
     if not ai_sdk_params["Data Catalog Connection"]:
         logging.warning("Could not establish connection to Data Catalog. Please check your configuration.")
-
-    yield
+    
+    return ai_sdk_params["Data Catalog Connection"]
 
 tags = [
     {"name": "Health Check"},
@@ -121,7 +124,6 @@ app = FastAPI(
     title = 'Denodo AI SDK',
     summary = 'Be fearless.',
     version = AI_SDK_VERSION,
-    lifespan = lifespan,
     docs_url = None,
     openapi_tags = tags
     )
@@ -164,10 +166,15 @@ app.include_router(answerMetadataQuestion.router)
 app.include_router(answerQuestionUsingViews.router)
 
 if __name__ == "__main__":
+    log_ai_sdk_parameters()
+    
     uvicorn.run(
         "api.main:app",
         host = AI_SDK_HOST,
         port = AI_SDK_PORT,
         ssl_keyfile = AI_SDK_SSL_KEY,
         ssl_certfile = AI_SDK_SSL_CERT,
+        log_config = log_config,
+        log_level = "info",
+        workers = AI_SDK_WORKERS
     )

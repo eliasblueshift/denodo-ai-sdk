@@ -207,13 +207,29 @@ def log_output(process, log_file, process_type, success_event):
                     version_match = re.search(r"Version:\s(.*)", line)
                     if version_match:
                         version = version_match.group(1)
+                        # If we already have the URL, print status and set success event
+                        if urls and not success_event.is_set():
+                            print_status("api", urls, version)
+                            success_event.set()
                 
                 if "Uvicorn running on" in line:
                     match = re.search(r"Uvicorn running on (https?://[\w.:]+)", line)
                     if match:
                         urls.append(match.group(1))
-                        print_status("api", urls, version)
-                        success_event.set()
+                        # If we already have version info, print status and set event
+                        if version is not None:
+                            print_status("api", urls, version)
+                            success_event.set()
+                        # If we don't have version yet, start a timer to wait for it
+                        elif not success_event.is_set():
+                            def delayed_status():
+                                if not success_event.is_set():
+                                    print_status("api", urls, version)
+                                    success_event.set()
+                            # Wait 5 seconds then print whatever we have
+                            t = threading.Timer(5.0, delayed_status)
+                            t.daemon = True
+                            t.start()
             
             elif process_type == "sample_chatbot" and "Running on" in line:
                 match = re.search(r"Running on (https?://[\w.:]+)", line)

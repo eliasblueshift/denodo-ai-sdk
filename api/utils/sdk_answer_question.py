@@ -14,7 +14,7 @@ from api.utils.sdk_utils import timing_context, is_data_complex, add_tokens
 
 async def process_sql_category(request, vector_search_tables, category_response, auth, timings, session_id = None):
     with timing_context("llm_time", timings):
-        vql_query, query_explanation, query_to_vql_tokens = sdk_ai_tools.query_to_vql(
+        vql_query, query_explanation, query_to_vql_tokens = await sdk_ai_tools.query_to_vql(
             query=request.question, 
             vector_search_tables=vector_search_tables, 
             llm_provider=request.sql_gen_provider, 
@@ -24,7 +24,7 @@ async def process_sql_category(request, vector_search_tables, category_response,
             session_id=session_id
         )
 
-        vql_query, _, query_fixer_tokens = sdk_ai_tools.query_fixer(
+        vql_query, _, query_fixer_tokens = await sdk_ai_tools.query_fixer(
             question=request.question,
             query=vql_query, 
             llm_provider=request.sql_gen_provider, 
@@ -39,7 +39,7 @@ async def process_sql_category(request, vector_search_tables, category_response,
     original_vql_query = vql_query
 
     while attempt < max_attempts:
-        vql_query, execution_result, vql_status_code, timings, fixer_history, query_fixer_tokens = attempt_query_execution(
+        vql_query, execution_result, vql_status_code, timings, fixer_history, query_fixer_tokens = await attempt_query_execution(
             vql_query=vql_query,
             request=request,
             auth=auth,
@@ -60,7 +60,7 @@ async def process_sql_category(request, vector_search_tables, category_response,
 
     if vql_status_code in [499, 500]:
         if vql_query:
-            execution_result, vql_status_code, timings = execute_query(
+            execution_result, vql_status_code, timings = await execute_query(
                 vql_query=vql_query, 
                 auth=auth, 
                 timings=timings
@@ -142,9 +142,9 @@ def process_unknown_category(timings):
         'total_execution_time': round(sum(timings.values()), 2) if timings else 0
     }
 
-def attempt_query_execution(vql_query, request, auth, timings, vector_search_tables, session_id, query_fixer_tokens=None, fixer_history=[]):
+async def attempt_query_execution(vql_query, request, auth, timings, vector_search_tables, session_id, query_fixer_tokens=None, fixer_history=[]):
     if vql_query:
-        execution_result, vql_status_code, timings = execute_query(
+        execution_result, vql_status_code, timings = await execute_query(
             vql_query=vql_query, 
             auth=auth, 
             timings=timings
@@ -163,7 +163,7 @@ def attempt_query_execution(vql_query, request, auth, timings, vector_search_tab
             llm = UniformLLM(request.sql_gen_provider, request.sql_gen_model)
             prompt = ChatPromptTemplate.from_messages(fixer_history)
             chain = prompt | llm.llm | StrOutputParser()
-            response = chain.invoke({}, config = {
+            response = await chain.ainvoke({}, config = {
             "callbacks": add_langfuse_callback(llm.callback, f"{llm.provider_name}.{llm.model_name}", session_id),
             "run_name": "fixer_dialogue",
         }
@@ -175,7 +175,7 @@ def attempt_query_execution(vql_query, request, auth, timings, vector_search_tab
     else:
         if vql_status_code == 500:
             with timing_context("llm_time", timings):
-                vql_query, fixer_history, query_fixer_tokens = sdk_ai_tools.query_fixer(
+                vql_query, fixer_history, query_fixer_tokens = await sdk_ai_tools.query_fixer(
                     question=request.question,
                     query=vql_query, 
                     error_log=execution_result,
@@ -187,7 +187,7 @@ def attempt_query_execution(vql_query, request, auth, timings, vector_search_tab
                 )            
         elif vql_status_code == 499:
             with timing_context("llm_time", timings):
-                vql_query, fixer_history, query_reviewer_tokens = sdk_ai_tools.query_reviewer(
+                vql_query, fixer_history, query_reviewer_tokens = await sdk_ai_tools.query_reviewer(
                     question=request.question,
                     vql_query=vql_query,
                     llm_provider=request.sql_gen_provider,
@@ -202,10 +202,10 @@ def attempt_query_execution(vql_query, request, auth, timings, vector_search_tab
             
     return vql_query, execution_result, vql_status_code, timings, fixer_history, query_fixer_tokens
 
-def execute_query(vql_query, auth, timings):
+async def execute_query(vql_query, auth, timings):
     with timing_context("vql_execution_time", timings):
         if vql_query:
-            vql_status_code, execution_result = execute_vql(vql=vql_query, auth=auth)
+            vql_status_code, execution_result = await execute_vql(vql=vql_query, auth=auth)
         else:
             vql_status_code = 499
             execution_result = "No VQL query was generated."

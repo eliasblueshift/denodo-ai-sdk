@@ -138,7 +138,7 @@ async def answer_metadata_question_post(
 async def process_metadata_question(request_data: answerMetadataQuestionRequest, auth: str):
     """Main function to process the metadata question and return the answer"""
     try:
-        vector_search_tables, timings = sdk_ai_tools.get_relevant_tables(
+        vector_search_tables, timings = await sdk_ai_tools.get_relevant_tables(
             query=request_data.question,
             embeddings_provider=request_data.embeddings_provider,
             embeddings_model=request_data.embeddings_model,

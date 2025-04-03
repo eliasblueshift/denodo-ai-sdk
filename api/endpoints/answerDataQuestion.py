@@ -143,7 +143,7 @@ async def process_data_question(request_data: answerDataQuestionRequest, auth: s
         # Generate session ID for Langfuse debugging purposes
         session_id = generate_session_id(request_data.question)
 
-        vector_search_tables, timings = sdk_ai_tools.get_relevant_tables(
+        vector_search_tables, timings = await sdk_ai_tools.get_relevant_tables(
             query=request_data.question,
             embeddings_provider=request_data.embeddings_provider,
             embeddings_model=request_data.embeddings_model,

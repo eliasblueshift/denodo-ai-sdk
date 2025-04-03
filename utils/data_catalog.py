@@ -14,7 +14,8 @@ import json
 import base64
 import logging
 import requests
-import concurrent.futures
+import aiohttp
+import asyncio
 from utils.utils import timed, log_params
 
 DATA_CATALOG_URL = os.getenv('DATA_CATALOG_URL', 'http://localhost:9090/denodo-data-catalog').rstrip('/') + '/'    
@@ -189,7 +190,7 @@ def get_views_metadata_documents(
         raise
 
 @timed
-def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CATALOG_EXECUTION_URL, 
+async def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CATALOG_EXECUTION_URL, 
                 server_id=DATA_CATALOG_SERVER_ID, verify_ssl=DATA_CATALOG_VERIFY_SSL):
     """
     Execute VQL against Data Catalog with support for OAuth token or Basic auth.
@@ -206,7 +207,7 @@ def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CATALOG_E
         Status code and parsed response or error message
     """
     logging.info("Preparing execution request")
-    
+        
     # Prepare headers based on auth type
     headers = {'Content-Type': 'application/json'}
     if isinstance(auth, tuple):
@@ -220,41 +221,45 @@ def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CATALOG_E
     }
 
     try:
-        response = requests.post(
-            f"{execution_url}?serverId={server_id}",
-            json=data,
-            headers=headers,
-            verify=verify_ssl
-        )
-        response.raise_for_status()
-
-        json_response = response.json()
-        
-        # Check for empty results in multiple scenarios
-        if not json_response.get('rows'):
-            logging.info("Query returned no results.")
-            return 499, "Query executed succesfully but returned an empty result (no rows)."
-        elif (len(json_response['rows']) == 1 and  # Single row
-            len(json_response['rows'][0]['values']) == 1 and  # Single column
-            (str(json_response['rows'][0]['values'][0]['value']) == '0' or  # Value is 0
-             json_response['rows'][0]['values'][0]['value'] is None)):  # Value is null/None
-            logging.info("Query returned only one row, one column with a value of 0 or null")
-            return 499, f"Query executed succesfully but returned a single row with a value of 0 or null: {parse_execution_json(json_response)}"
-        logging.info("Query executed successfully")
-        return response.status_code, parse_execution_json(json_response)
-    except requests.HTTPError as e:
-        error_response = json.loads(e.response.text)
-        error_message = parse_execution_error(error_response.get('message', 'Data Catalog did not return further details'))
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{execution_url}?serverId={server_id}",
+                json=data,
+                headers=headers,
+                ssl=verify_ssl
+            ) as response:
+                response.raise_for_status()
+                json_response = await response.json()
+                
+                # Check for empty results in multiple scenarios
+                if not json_response.get('rows'):
+                    logging.info("Query returned no results.")
+                    return 499, "Query executed succesfully but returned an empty result (no rows)."
+                elif (len(json_response['rows']) == 1 and  # Single row
+                    len(json_response['rows'][0]['values']) == 1 and  # Single column
+                    (str(json_response['rows'][0]['values'][0]['value']) == '0' or  # Value is 0
+                     json_response['rows'][0]['values'][0]['value'] is None)):  # Value is null/None
+                    logging.info("Query returned only one row, one column with a value of 0 or null")
+                    return 499, f"Query executed succesfully but returned a single row with a value of 0 or null: {parse_execution_json(json_response)}"
+                logging.info("Query executed successfully")
+                return response.status, parse_execution_json(json_response)
+    except aiohttp.ClientResponseError as e:
+        try:
+            error_text = await e.response.text()
+            error_response = json.loads(error_text)
+            error_message = parse_execution_error(error_response.get('message', 'Data Catalog did not return further details'))
+        except (json.JSONDecodeError, AttributeError):
+            error_message = f"HTTP Error: {e.status} - {e.message}"
         logging.error(f"Data Catalog execute VQL failed: {error_message}")
-        return e.response.status_code, error_message
-    except requests.RequestException as e:
+        return e.status, error_message
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         error_message = f"Failed to connect to the server: {str(e)}"
         logging.error(f"{error_message}. VQL: {vql}")
         return 500, error_message
-    
+
 @log_params
 @timed
-def get_allowed_view_ids(
+async def get_allowed_view_ids(
     auth,
     database_names=None,
     tag_names=None,
@@ -276,7 +281,6 @@ def get_allowed_view_ids(
     Returns:
        List of allowed view IDs across all databases
     """
-
     # Prepare headers based on auth type
     headers = {
         'accept': 'application/json',
@@ -288,7 +292,7 @@ def get_allowed_view_ids(
         )
     }
 
-    def fetch_view_ids(name, type = 'DATABASE'):
+    async def fetch_view_ids(session, name, type='DATABASE'):
         data = {
             "dataMode": type,
         }
@@ -298,31 +302,40 @@ def get_allowed_view_ids(
             data["tagNames"] = [name]
 
         try:
-            response = requests.post(
+            async with session.post(
                 f"{permissions_url}?serverId={server_id}",
                 json=data,
                 headers=headers,
-                verify=verify_ssl
-            )
-            response.raise_for_status()
-            view_ids = response.json()
-            
-            if not isinstance(view_ids, list) or not all(isinstance(id, int) for id in view_ids):
-                raise ValueError(f"Unexpected response format for {name}: not a list of integers")
-            
-            return view_ids
-        except (requests.RequestException, ValueError) as e:
+                ssl=verify_ssl
+            ) as response:
+                response.raise_for_status()
+                view_ids = await response.json()
+                
+                if not isinstance(view_ids, list) or not all(isinstance(id, int) for id in view_ids):
+                    raise ValueError(f"Unexpected response format for {name}: not a list of integers")
+                
+                return view_ids
+        except (aiohttp.ClientError, ValueError) as e:
             logging.error(f"Failed to retrieve allowed view IDs for {name}: {str(e)}")
             return None
 
-    # Use ThreadPoolExecutor for concurrent requests
+    # Use aiohttp for concurrent requests
     allowed_view_ids = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(fetch_view_ids, db, 'DATABASE') for db in database_names]
-        futures.extend([executor.submit(fetch_view_ids, tag, 'TAG') for tag in tag_names])
-
-        for future in concurrent.futures.as_completed(futures):
-            if view_ids := future.result():
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        # Create tasks for databases
+        if database_names:
+            tasks.extend([fetch_view_ids(session, db, 'DATABASE') for db in database_names])
+        # Create tasks for tags
+        if tag_names:
+            tasks.extend([fetch_view_ids(session, tag, 'TAG') for tag in tag_names])
+        
+        # Execute all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        
+        # Collect results
+        for view_ids in results:
+            if view_ids:
                 allowed_view_ids.extend(view_ids)
 
     unique_view_ids = list(set(allowed_view_ids))
