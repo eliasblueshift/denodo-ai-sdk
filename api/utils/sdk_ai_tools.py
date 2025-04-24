@@ -356,8 +356,7 @@ async def sql_category(query, vector_search_tables, llm_provider, llm_model, mod
             custom_instructions=custom_instructions,
             session_id=session_id
         )
-
-    if mode == 'data':
+    elif mode == 'data':
         return await direct_sql_category(
             query=query, 
             vector_search_tables=vector_search_tables, 
@@ -406,7 +405,15 @@ async def sql_category(query, vector_search_tables, llm_provider, llm_model, mod
                 # Cancel the SQL task
                 sql_task.cancel()
                 return metadata_result
-                
+        elif first_completed == sql_task:
+            response = first_completed.result()
+            category = utils.custom_tag_parser(response, 'cat', default="OTHER")[0].strip()
+            if category == "SQL":
+                # Cancel the metadata task
+                metadata_task.cancel()
+            else:
+                return await metadata_task
+        
         # If sql_task is already done, get its result
         if sql_task in done:
             response = sql_task.result()
