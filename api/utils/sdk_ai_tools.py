@@ -70,14 +70,14 @@ async def generate_view_answer(query, vql_query, vql_execution_result, llm_provi
     
 @utils.log_params
 @utils.timed
-async def query_to_vql(query, vector_search_tables, llm_provider, llm_model, filter_params = '', custom_instructions = '', session_id = None):
+async def query_to_vql(query, vector_search_tables, llm_provider, llm_model, filter_params = '', custom_instructions = '', session_id = None, sample_data = None):
     llm = UniformLLM(llm_provider, llm_model)
     prompt = PromptTemplate.from_template(QUERY_TO_VQL_PROMPT)
     query = re.sub(r'(?i)sql', 'VQL', query)
     chain = prompt | llm.llm | StrOutputParser()
 
     filtered_tables = utils.custom_tag_parser(filter_params, 'table', default = [])
-    relevant_tables = format_schema_text(vector_search_tables, filtered_tables)
+    relevant_tables = format_schema_text(vector_search_tables, filtered_tables, sample_data)
 
     prompt_parts = {
         "having": int("<having>" in filter_params),
@@ -114,18 +114,22 @@ async def query_to_vql(query, vector_search_tables, llm_provider, llm_model, fil
 
     vql_query = utils.custom_tag_parser(response, 'vql', default='')[0].strip()
     query_explanation = utils.custom_tag_parser(response, 'thoughts', default='')[0].strip()
+    conditions = utils.custom_tag_parser(response, 'conditions', default='')[0].strip()
+
+    if conditions != "None":
+        query_explanation = f"{query_explanation}\n\nConditions: {conditions}"
 
     return vql_query, query_explanation, llm.tokens
 
 @utils.log_params
 @utils.timed
-async def related_questions(question, sql_query, execution_result, vector_search_tables, llm_provider, llm_model, custom_instructions = '', session_id = None):
+async def related_questions(question, sql_query, execution_result, vector_search_tables, llm_provider, llm_model, custom_instructions = '', session_id = None, sample_data = None):
     llm = UniformLLM(llm_provider, llm_model)
     prompt = PromptTemplate.from_template(RELATED_QUESTIONS_PROMPT)
     chain = prompt | llm.llm | StrOutputParser()
 
     schema = [table for table in vector_search_tables if table['view_name'] in sql_query.replace('"', '')]
-    relevant_tables = format_schema_text(schema, [])
+    relevant_tables = format_schema_text(schema, [], sample_data)
 
     response = await chain.ainvoke(
         {
@@ -144,7 +148,7 @@ async def related_questions(question, sql_query, execution_result, vector_search
 
     return related_questions, llm.tokens
 
-def format_schema_text(vector_search_tables, filtered_tables):
+def format_schema_text(vector_search_tables, filtered_tables, sample_data, examples_per_table = 3):
     """
     Formats and optimizes schema data into a readable text format with reduced token usage for LLMs.
     """
@@ -167,26 +171,30 @@ def format_schema_text(vector_search_tables, filtered_tables):
             parts.append(f"[{' '.join(flags)}]")
         if desc:
             parts.append(f"- {desc if desc.endswith('.') else desc + '.'}")
-        if examples and len(examples) > 0:
-            parts.append(f"sample values: {', '.join(examples)}")
+        if examples:
+            filtered_examples = [example for example in examples if example]
+            if filtered_examples:
+                parts.append(f"sample values: {', '.join(filtered_examples[:examples_per_table])}")
 
         return " ".join(parts)
 
-    def format_table(table):
+    def format_table(table, sample_data, present_tables = []):
         lines = []
         table_name = table.get('tableName', 'unnamed_database.unnamed_table')
         table_description = table.get('description', '')
+        table_id = str(table.get('id'))
         database_name, view_name = table_name.split('.')
         table_name = f'"{database_name}"."{view_name}"'
         lines.append(f"# Table: {table_name}")
-
         if table_description:
             lines.append(f"## Description:\n{table_description}")
-
         lines.append("## Columns:")
         # Format columns
         schema = table.get('schema', [])
         for col in schema:
+            if sample_data and table_id in sample_data:
+                col_sample_data = sample_data[table_id].get(col.get('columnName'), [])
+                col['sample_data'] = col_sample_data
             lines.append(format_column(col))
 
         # Format associations
@@ -195,29 +203,30 @@ def format_schema_text(vector_search_tables, filtered_tables):
             lines.append("## Joins:")
             for assoc in associations:
                 where_clause = assoc.get('where')
-                if where_clause:
-                    lines.append(f"→ {where_clause}")
+                if where_clause and sum(table in where_clause for table in present_tables) == 2:
+                        lines.append(f"→ {where_clause}")
 
         return "\n".join(lines)
 
     formatted_tables = []
     # Create a lookup dictionary for faster access
     table_lookup = {t['view_name']: t['view_json'] for t in vector_search_tables}
+    present_tables = [table['view_name'] for table in vector_search_tables]
     if not filtered_tables:
-        return "\n\n".join([format_table(table_lookup[table['view_name']]) for table in vector_search_tables])
+        return "\n\n".join([format_table(table_lookup[table['view_name']], sample_data, present_tables) for table in vector_search_tables])
 
     for filtered_table in filtered_tables:
         if filtered_table not in table_lookup:
             continue
 
         table_json = table_lookup[filtered_table].copy()
-        formatted_table = format_table(table_json)
+        formatted_table = format_table(table_json, sample_data, filtered_tables)
         formatted_tables.append(formatted_table)
 
     if formatted_tables:
         return "\n\n".join(formatted_tables)
     else:
-        return "\n\n".join([format_table(table_lookup[table['view_name']]) for table in vector_search_tables])
+        return "\n\n".join([format_table(table_lookup[table['view_name']], sample_data, present_tables) for table in vector_search_tables])
 
 @utils.log_params
 def get_relevant_tables_json(vector_search_tables, filtered_tables):
@@ -437,7 +446,6 @@ async def graph_generator(query, data_file, execution_result, llm_provider, llm_
     python_code = utils.custom_tag_parser(response, 'python', default = '')[0].strip()
 
     python_repl = PythonREPL()
-    # Run the synchronous PythonREPL in a separate thread
     output = await asyncio.to_thread(python_repl.run, python_code)
 
     # Check if the \n at the end of the string and remove it
@@ -448,15 +456,15 @@ async def graph_generator(query, data_file, execution_result, llm_provider, llm_
 
 @utils.log_params
 @utils.timed
-async def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, error_log=False, error_categories=[], fixer_history=[], session_id = None):
+async def query_fixer(question, query, llm_provider, llm_model, vector_search_tables, error_log=False, error_categories=[], fixer_history=[], session_id = None, query_explanation = '', sample_data = None):
     llm = UniformLLM(llm_provider, llm_model)
     
     if not error_log:
         query, error_log, error_categories = sdk_utils.prepare_vql(query)
 
     schema = [table for table in vector_search_tables if table['view_name'] in query.replace('"', '')]
-    relevant_tables = format_schema_text(schema, [])
-    prompt, parameters = _get_prompt_and_parameters(question, query, error_log, error_categories, relevant_tables)
+    relevant_tables = format_schema_text(schema, [], sample_data)
+    prompt, parameters = _get_prompt_and_parameters(question, query, error_log, error_categories, relevant_tables, query_explanation)
     
     if not prompt:
         logging.info("VQL query is valid, continuing execution.")
@@ -485,13 +493,13 @@ async def query_fixer(question, query, llm_provider, llm_model, vector_search_ta
 
 @utils.log_params
 @utils.timed
-async def query_reviewer(question, vql_query, llm_provider, llm_model, vector_search_tables, session_id = None, fixer_history=[]):
+async def query_reviewer(question, vql_query, llm_provider, llm_model, vector_search_tables, session_id = None, fixer_history=[], sample_data = None):
     llm = UniformLLM(llm_provider, llm_model)
     final_prompt = PromptTemplate.from_template(QUERY_REVIEWER_PROMPT)
     final_chain = final_prompt | llm.llm | StrOutputParser()
 
     schema = [table for table in vector_search_tables if table['view_name'] in vql_query.replace('"', '')]
-    relevant_tables = format_schema_text(schema, [])
+    relevant_tables = format_schema_text(schema, [], sample_data)
 
     vql_restrictions = sdk_utils.generate_vql_restrictions(
         prompt_parts={"dates": 1, "arithmetic": 1, "groupby": 1, "having": 1},
@@ -531,7 +539,7 @@ async def query_reviewer(question, vql_query, llm_provider, llm_model, vector_se
     fixer_history.extend([('human', input_prompt), ('ai', response)])
     return new_vql_query, fixer_history, llm.tokens
 
-def _get_prompt_and_parameters(question, vql_query, error_log, error_categories, schema):
+def _get_prompt_and_parameters(question, vql_query, error_log, error_categories, schema, query_explanation):
     error_handlers = {
         "LIMIT_SUBQUERY": (FIX_LIMIT_PROMPT, "LIMIT in subquery detected, fixing."),
         "LIMIT_OFFSET": (FIX_OFFSET_PROMPT, "LIMIT OFFSET detected, fixing."),
@@ -557,14 +565,15 @@ def _get_prompt_and_parameters(question, vql_query, error_log, error_categories,
             "query_error": error_log,
             "vql_restrictions": vql_restrictions,
             "schema": schema,
-            "question": question
+            "question": question,
+            "query_explanation": query_explanation
         }
 
     return None, None
 
 @utils.log_params
 @utils.timed
-async def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_store_provider, vdb_list, tag_list,auth, k = 5, use_views = '', expand_set_views = True):
+async def get_relevant_tables(query, embeddings_provider, embeddings_model, vector_store_provider, vdb_list, tag_list, auth, k = 5, use_views = '', expand_set_views = True, vector_search_sample_data_k = 3):
     vdb_list = [db.strip() for db in vdb_list.split(',')] if vdb_list else []
     tag_list = [tag.strip() for tag in tag_list.split(',')] if tag_list else []
     
@@ -576,22 +585,30 @@ async def get_relevant_tables(query, embeddings_provider, embeddings_model, vect
         embeddings_model = embeddings_model
     )
 
-    if not vdb_list and not tag_list:
-        vdb_list = vector_store.get_database_names()
-        tag_list = vector_store.get_tag_names()
+    sample_data_vector_store = UniformVectorStore(
+        provider = vector_store_provider,
+        embeddings_provider = embeddings_provider,
+        embeddings_model = embeddings_model,
+        index_name = "ai_sdk_sample_data"
+    )
     
-    embedded_query = await vector_store.embeddings.aembed_query(query)
+    # Create tasks for both async operations to run in parallel
+    embedding_task = asyncio.create_task(vector_store.embeddings.aembed_query(query))
+    view_ids_task = asyncio.create_task(get_allowed_view_ids(auth=auth))
+    
+    # Wait for both tasks to complete
+    embedded_query, valid_view_ids = await asyncio.gather(embedding_task, view_ids_task)
+    
+    # Convert view_ids to strings
+    valid_view_ids = [str(view_id) for view_id in valid_view_ids]
+
     search_params = {
         "vector": embedded_query,
         "k": k,
-        "scores": False,
         "database_names": vdb_list,
-        "tag_names": tag_list
+        "tag_names": tag_list,
+        "view_ids": valid_view_ids
     }
-
-    valid_view_ids = await get_allowed_view_ids(auth = auth, database_names = vdb_list, tag_names = tag_list)
-    valid_view_ids = [str(view_id) for view_id in valid_view_ids]
-    search_params["view_ids"] = valid_view_ids
 
     with sdk_utils.timing_context("vector_store_search_time", timings):
         vector_search = vector_store.search_by_vector(**search_params)
@@ -607,7 +624,8 @@ async def get_relevant_tables(query, embeddings_provider, embeddings_model, vect
             relevant_tables.append({
                 "view_text": table.page_content,
                 "view_name": table.metadata['view_name'],
-                "view_json": json.loads(table.metadata['view_json'])
+                "view_json": json.loads(table.metadata['view_json']),
+                "view_id": table.metadata['view_id']
             })
 
     MAX_ROUNDS = 2
@@ -627,43 +645,46 @@ async def get_relevant_tables(query, embeddings_provider, embeddings_model, vect
                 relevant_tables.append({
                     "view_text": table.page_content,
                     "view_name": table.metadata['view_name'],
-                    "view_json": json.loads(table.metadata['view_json'])
+                    "view_json": json.loads(table.metadata['view_json']),
+                    "view_id": table.metadata['view_id']
                 })
         
         current_round += 1
 
-    existing_view_names = set(table['view_name'] for table in relevant_tables)
     new_associations = []
 
     # Get associations for each table
     for table in relevant_tables:
         table_associations = utils.get_table_associations(table['view_name'], table['view_json'])
         new_associations.extend([
-            assoc for assoc in table_associations
-            if assoc not in existing_view_names
+            assoc_id for assoc_id in table_associations
+            if assoc_id not in seen_view_ids
         ])
 
     if use_views != '':
         use_views = [view.strip() for view in use_views.split(',')]
+        use_view_ids = vector_store.get_view_ids(use_views)
         new_associations.extend([
-            view for view in use_views
-            if view not in existing_view_names
+            view_id for view_id in use_view_ids
+            if view_id not in seen_view_ids
         ])
 
     # Remove duplicates from new_associations
     new_associations = list(set(new_associations))
+    new_associations = [assoc_id for assoc_id in new_associations if assoc_id in valid_view_ids]
 
     if new_associations:
         # Lookup new associations in vector_store
         with sdk_utils.timing_context("vector_store_search_time", timings):
-            association_lookup = vector_store.get_views(new_associations, valid_view_ids)
+            association_lookup = vector_store.get_views(new_associations)
 
         # Add new associations to relevant_tables
         for assoc in association_lookup:
             relevant_tables.append({
                 "view_text": assoc.page_content,
                 "view_name": assoc.metadata['view_name'],
-                "view_json": sdk_utils.filter_non_allowed_associations(json.loads(assoc.metadata['view_json']), valid_view_ids)
+                "view_json": sdk_utils.filter_non_allowed_associations(json.loads(assoc.metadata['view_json']), valid_view_ids),
+                "view_id": assoc.metadata['view_id']
             })
 
     if not expand_set_views:
@@ -672,4 +693,29 @@ async def get_relevant_tables(query, embeddings_provider, embeddings_model, vect
         else:
             relevant_tables = []
 
-    return relevant_tables, timings
+    sample_data = {}
+    for table in relevant_tables:
+        view_id = str(table['view_id'])
+        result = sample_data_vector_store.search_by_vector(
+            vector = embedded_query,
+            k = vector_search_sample_data_k,
+            view_ids = [view_id]
+        )
+
+        if result and len(result) > 0:
+            # Parse column names from the metadata
+            column_names = [col.strip() for col in result[0].metadata['columns'].split(',') if col.strip()]
+            
+            # Initialize the sample values for each column
+            column_samples = {col: [] for col in column_names}
+            
+            # Process each row to extract sample values
+            for row in result:
+                # Parse the page_content into values
+                values = [value.strip() for value in row.page_content.strip().split(',')]
+                
+                for col, val in zip(column_names, values):
+                    column_samples[col].append(val)
+            
+            sample_data[view_id] = column_samples
+    return relevant_tables, sample_data, timings

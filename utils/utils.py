@@ -13,10 +13,10 @@ import re
 import os
 import pytz
 import json
+import asyncio
 import logging
 import tiktoken
 import functools
-import asyncio
 
 from time import time
 from uuid import uuid4
@@ -155,7 +155,7 @@ def get_table_associations(table_name, table_json):
     if table_name == schema_table_name:
         if 'associations' in table_json:
             for association in table_json['associations']:
-                table_associations.append(association['table_name'])
+                table_associations.append(str(association['table_id']))
     return table_associations
 
 # Summarize a schema
@@ -179,18 +179,10 @@ def schema_summary(schema):
         else:
             column_description = None
 
-        examples = schema.get('exampleRow')
+        examples = schema.get('sample_data', [])
 
-        example_values = []
-
-        if examples is not None:
-            for example_dict in examples:
-                if example_dict['fieldName'] == column_name:
-                    example_values.extend(example_dict['fieldValues'])
-                    break
-
-        if len(example_values) != 0:
-            example_values = list(set(example_values))
+        if len(examples) > 0:
+            example_values = list(set(examples))
             example_values_str = ', '.join(example_values)
             example_value = f" Example value: {example_values_str}"
         else:
@@ -235,7 +227,7 @@ def flatten_list(list_of_lists):
     flattened_list = [x for item in list_of_lists for x in (item if isinstance(item, list) else [item])]
     return flattened_list
 
-def create_chunks(table):
+def create_chunks(table, embeddings_token_limit):
     """
     This function takes a string (schema_summary) and keeps everything before the line with Columns:
     Everything before that is the header and will be kept in every chunk.
@@ -267,7 +259,7 @@ def create_chunks(table):
     # Account for header and association footer in token calculation
     base_content = header + association_footer
     base_tokens = calculate_tokens(base_content)
-    available_tokens = 7500 - base_tokens
+    available_tokens = (embeddings_token_limit - 500) - base_tokens
     
     column_content = "\n".join(column_lines)
     total_tokens = calculate_tokens(column_content)
@@ -298,21 +290,61 @@ def create_chunks(table):
     return chunks
 
 @timed
-def prepare_schema(schema, embeddings_token_limit = 0):
+def prepare_sample_data_schema(schema):
+    def create_sample_data_document(table):
+        table_id = str(table['id'])
+        columns = []
+        examples = []
+        max_sample_data_length = 0
+        for column in table['schema']:
+            columns.append(column.get('columnName'))
+            examples.append(column.get('sample_data', []))
+            max_sample_data_length = max(max_sample_data_length, len(column.get('sample_data', [])))
+        
+        for example in examples:
+            if len(example) < max_sample_data_length:
+                example.extend([''] * (max_sample_data_length - len(example)))
 
-    def create_document(table, embeddings_token_limit):            
+        base_metadata = {
+            "columns": ','.join(columns),
+            "view_id": table_id
+        }
+
+        tuples = list(map(list, zip(*examples)))
+        return [Document(
+            id=f"{table_id}_{i}",
+            page_content=','.join(tuple),
+            metadata=base_metadata
+        ) for i, tuple in enumerate(tuples)]
+    
+    return [create_sample_data_document(table) for table in schema['databaseTables']]
+
+@timed
+def prepare_last_update_vector(last_update):
+    return [Document(
+        id="last_update",
+        page_content="last_update",
+        metadata={"last_update": last_update}
+    )]
+
+@timed
+def prepare_schema(schema, embeddings_token_limit = 0):
+    def create_document(table, embeddings_token_limit):      
         table_summary = schema_summary(table)
         table_summary_tokens = calculate_tokens(table_summary)
         if embeddings_token_limit and table_summary_tokens > embeddings_token_limit:
-            return create_chunks(table)
+            return create_chunks(table, embeddings_token_limit)
 
         base_metadata = {
             "view_name": table['tableName'],
             "view_json": json.dumps(table),
             "view_id": str(table['id']),
             "database_name": table['tableName'].split('.')[0],
-            "tag_names": str([tag['name'] for tag in table.get('tagDetails', [])])
+            "last_update": int(time() * 1000)
         }
+
+        for tag in table.get('tagDetails', []):
+            base_metadata[f"tag_{tag['name']}"] = "1"
 
         return Document(
             id=str(table['id']),
@@ -401,12 +433,12 @@ class TokenCounter(BaseCallbackHandler):
 
     def on_llm_start(self, serialized, prompts, **kwargs):
         for p in prompts:
-            self.tokens['input_tokens'] += self.llm.get_num_tokens(p)
+            self.tokens['input_tokens'] += calculate_tokens(p)
 
     def on_llm_end(self, response, **kwargs):
         results = response.flatten()
         for r in results:
-            self.tokens['output_tokens'] = self.llm.get_num_tokens(r.generations[0][0].text)
+            self.tokens['output_tokens'] = calculate_tokens(r.generations[0][0].text)
         self.tokens['total_tokens'] = self.tokens['input_tokens'] + self.tokens['output_tokens']
 
     def reset_tokens(self):

@@ -3,10 +3,12 @@ import Modal from 'react-bootstrap/Modal';
 import Button from 'react-bootstrap/Button';
 import Form from 'react-bootstrap/Form';
 import Spinner from 'react-bootstrap/Spinner';
+import Alert from 'react-bootstrap/Alert';
 
 const CSVUploadModal = ({ show, handleClose, onUpload }) => {
   const [file, setFile] = useState(null);
   const [description, setDescription] = useState('');
+  const [delimiter, setDelimiter] = useState(';');
   const [isLoading, setIsLoading] = useState(false);
 
   const handleFileChange = (e) => {
@@ -24,7 +26,7 @@ const CSVUploadModal = ({ show, handleClose, onUpload }) => {
     if (file && description) {
       setIsLoading(true);
       try {
-        await onUpload(file, description);
+        await onUpload(file, description, delimiter);
       } catch (error) {
         console.error('Error uploading CSV:', error);
         alert(error.response?.data?.error || 'An error occurred while uploading the CSV file.');
@@ -43,10 +45,28 @@ const CSVUploadModal = ({ show, handleClose, onUpload }) => {
         <Modal.Title>Upload CSV File</Modal.Title>
       </Modal.Header>
       <Modal.Body>
+        <Alert variant="info">
+          <small>
+            Please make sure your CSV file is UTF-8 encoded. The recommended delimiter is semicolon (;).
+          </small>
+        </Alert>
         <Form onSubmit={handleSubmit}>
           <Form.Group controlId="formFile" className="mb-3">
             <Form.Label>Select CSV file</Form.Label>
             <Form.Control type="file" onChange={handleFileChange} accept=".csv" />
+          </Form.Group>
+          <Form.Group controlId="formDelimiter" className="mb-3">
+            <Form.Label>CSV Delimiter</Form.Label>
+            <Form.Control
+              type="text"
+              placeholder="Enter delimiter character"
+              value={delimiter}
+              onChange={(e) => setDelimiter(e.target.value)}
+              maxLength={1}
+            />
+            <Form.Text className="text-muted">
+              Default is semicolon (;). Use comma (,) for comma-separated files.
+            </Form.Text>
           </Form.Group>
           <Form.Group controlId="formDescription" className="mb-3">
             <Form.Label>Description</Form.Label>

@@ -10,7 +10,6 @@
 """
 
 import os
-import traceback
 
 from pydantic import BaseModel, Field
 from typing import Dict, Annotated, List, Literal
@@ -20,7 +19,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context, add_tokens, generate_session_id
+from api.utils.sdk_utils import timing_context, add_tokens, generate_session_id, handle_endpoint_error
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
@@ -57,6 +56,7 @@ class answerQuestionRequest(BaseModel):
     custom_instructions: str = os.getenv('CUSTOM_INSTRUCTIONS', '')
     markdown_response: bool = True
     vector_search_k: int = 5
+    vector_search_sample_data_k: int = 3
     mode: Literal["default", "data", "metadata"] = Field(default = "default")
     disclaimer: bool = True
     verbose: bool = True
@@ -75,35 +75,13 @@ class answerQuestionResponse(BaseModel):
     llm_time: float
     total_execution_time: float
 
-ANSWER_QUESTION_DOCS = """
-This endpoint processes a natural language question and:
-
-- Searches for relevant tables using vector search
-- Determines whether the question should be answered using a SQL query or a metadata search
-- Generates a VQL query using an LLM if the question should be answered using a SQL query
-- Executes the VQL query and gets the data
-- Generates an answer to the question using the data and the VQL query
-
-This endpoint will also automatically look for the the following values in the environment variables for convenience:
-
-- EMBEDDINGS_PROVIDER
-- EMBEDDINGS_MODEL
-- VECTOR_STORE
-- SQL_GENERATION_PROVIDER
-- SQL_GENERATION_MODEL
-- CHAT_PROVIDER
-- CHAT_MODEL
-- VDB_NAMES
-
-As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
-is a complex task that should be handled with a powerful LLM."""
-
 @router.get(
         '/answerQuestion',
         response_class = JSONResponse,
         response_model=answerQuestionResponse,
         tags = ['Ask a Question']
 )
+@handle_endpoint_error("answerQuestion")
 async def answer_question_get(
     request: answerQuestionRequest = Depends(),
     auth: str = Depends(authenticate),
@@ -136,6 +114,7 @@ async def answer_question_get(
         response_class = JSONResponse,
         response_model=answerQuestionResponse,
         tags = ['Ask a Question'])
+@handle_endpoint_error("answerQuestion")
 async def answer_question_post(
     endpoint_request: answerQuestionRequest,
     auth: str = Depends(authenticate),
@@ -165,62 +144,55 @@ async def answer_question_post(
 
 async def process_question(request_data: answerQuestionRequest, auth: str):
     """Main function to process the question and return the answer"""
-    try:
-        # Generate session ID for Langfuse debugging purposes
-        session_id = generate_session_id(request_data.question)
+    # Generate session ID for Langfuse debugging purposes
+    session_id = generate_session_id(request_data.question)
 
-        vector_search_tables, timings = await sdk_ai_tools.get_relevant_tables(
-            query=request_data.question,
-            embeddings_provider=request_data.embeddings_provider,
-            embeddings_model=request_data.embeddings_model,
-            vector_store_provider=request_data.vector_store_provider,
-            vdb_list=request_data.vdp_database_names,
-            tag_list=request_data.vdp_tag_names,
-            auth=auth,
-            k=request_data.vector_search_k,
-            use_views=request_data.use_views,
-            expand_set_views=request_data.expand_set_views
+    vector_search_tables, sample_data, timings = await sdk_ai_tools.get_relevant_tables(
+        query=request_data.question,
+        embeddings_provider=request_data.embeddings_provider,
+        embeddings_model=request_data.embeddings_model,
+        vector_store_provider=request_data.vector_store_provider,
+        vdb_list=request_data.vdp_database_names,
+        tag_list=request_data.vdp_tag_names,
+        auth=auth,
+        k=request_data.vector_search_k,
+        use_views=request_data.use_views,
+        expand_set_views=request_data.expand_set_views,
+        vector_search_sample_data_k=request_data.vector_search_sample_data_k
+    )
+
+    with timing_context("llm_time", timings):
+        category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
+            query=request_data.question, 
+            vector_search_tables=vector_search_tables, 
+            llm_provider=request_data.chat_provider,
+            llm_model=request_data.chat_model,
+            mode=request_data.mode,
+            custom_instructions=request_data.custom_instructions,
+            session_id=session_id
         )
 
-        with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
-                query=request_data.question, 
-                vector_search_tables=vector_search_tables, 
-                llm_provider=request_data.chat_provider,
-                llm_model=request_data.chat_model,
-                mode=request_data.mode,
-                custom_instructions=request_data.custom_instructions,
-                session_id=session_id
-            )
+    if category == "SQL":
+        response = await sdk_answer_question.process_sql_category(
+            request=request_data, 
+            vector_search_tables=vector_search_tables, 
+            category_response=category_response,
+            auth=auth, 
+            timings=timings,
+            session_id=session_id,
+            sample_data=sample_data
+        )
+        response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
+    elif category == "METADATA":
+        response = sdk_answer_question.process_metadata_category(
+            category_response=category_response, 
+            category_related_questions=category_related_questions, 
+            vector_search_tables=vector_search_tables, 
+            disclaimer=request_data.disclaimer,
+            tokens=sql_category_tokens,
+            timings=timings,
+        )
+    else:
+        response = sdk_answer_question.process_unknown_category(timings=timings)
 
-        if category == "SQL":
-            response = await sdk_answer_question.process_sql_category(
-                request=request_data, 
-                vector_search_tables=vector_search_tables, 
-                category_response=category_response,
-                auth=auth, 
-                timings=timings,
-                session_id=session_id
-            )
-            response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
-        elif category == "METADATA":
-            response = sdk_answer_question.process_metadata_category(
-                category_response=category_response, 
-                category_related_questions=category_related_questions, 
-                vector_search_tables=vector_search_tables, 
-                disclaimer=request_data.disclaimer,
-                tokens=sql_category_tokens,
-                timings=timings,
-            )
-        else:
-            response = sdk_answer_question.process_unknown_category(timings=timings)
-
-        return JSONResponse(content=jsonable_encoder(response), media_type='application/json')
-    except Exception as e:
-
-        error_details = {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-        raise HTTPException(status_code=500, detail=error_details)
+    return JSONResponse(content=jsonable_encoder(response), media_type='application/json')

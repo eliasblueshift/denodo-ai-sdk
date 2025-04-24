@@ -5,10 +5,14 @@ import argparse
 import requests
 import threading
 import subprocess
-from datetime import datetime
-from rich.console import Console
-from rich.panel import Panel
+import platform
+
 from rich.text import Text
+from rich.panel import Panel
+from rich.console import Console
+
+from datetime import datetime
+from dotenv import dotenv_values
 
 console = Console()
 
@@ -25,6 +29,7 @@ def parse_arguments():
     parser.add_argument("--dc-password", default="admin", help="Data Catalog password (default: admin)")
     parser.add_argument("--no-logs", action="store_true", help="Output logs to console instead of files")
     parser.add_argument("--max-log-size", type=int, default=1, help="Maximum log file size in MB before rotation (default: 1)")
+    parser.add_argument("--production", action="store_true", help="Run in production mode")
     return parser.parse_args()
 
 def empty_file(file_path):
@@ -135,23 +140,64 @@ def print_status(process_type, urls, version=None):
         )
     console.print(panel)
 
-def run_process(process_type, timeout=30, no_logs=False, max_log_size=1):
-    """
-    Unified function to run either API or chatbot process with timeout monitoring
-    @param process_type: Either 'api' or 'sample_chatbot'
-    @param timeout: Time in seconds to wait for success signal
-    @param no_logs: Whether to output logs to console instead of files
-    @param max_log_size: Maximum log file size in MB before rotation
-    """
+def run_process(process_type, timeout=30, no_logs=False, max_log_size=1, production=False):
     env = os.environ.copy()
     env['PYTHONIOENCODING'] = 'utf-8'
     
+    # Load environment variables from the appropriate .env file
+    if process_type == "api":
+        if os.path.exists("api/utils/sdk_config.env"):
+            sdk_vars = dotenv_values("api/utils/sdk_config.env")
+            HOST = sdk_vars.get("AI_SDK_HOST", "0.0.0.0")
+            PORT = sdk_vars.get("AI_SDK_PORT", "8008")
+            WORKERS = sdk_vars.get("AI_SDK_WORKERS", "1")
+            SSL_CERT = sdk_vars.get("AI_SDK_SSL_CERT", None)
+            SSL_KEY = sdk_vars.get("AI_SDK_SSL_KEY", None)
+        else:
+            console.print("[yellow]Warning:[/] Environment file api/utils/sdk_config.env not found.")
+    elif process_type == "sample_chatbot":
+        if os.path.exists("sample_chatbot/chatbot_config.env"):
+            chatbot_vars = dotenv_values("sample_chatbot/chatbot_config.env")
+            HOST = chatbot_vars.get("CHATBOT_HOST", "0.0.0.0")
+            PORT = chatbot_vars.get("CHATBOT_PORT", "9992")
+            WORKERS = chatbot_vars.get("CHATBOT_WORKERS", "1")
+            SSL_CERT = chatbot_vars.get("CHATBOT_SSL_CERT", None)
+            SSL_KEY = chatbot_vars.get("CHATBOT_SSL_KEY", None)
+        else:
+            console.print("[yellow]Warning:[/] Environment file sample_chatbot/chatbot_config.env not found.")
+        
     success_event = threading.Event()
     default_log_path = os.path.join("logs", f"{process_type}.log")
-    
+
     with console.status(f"[bold blue]Starting {process_type}...", spinner="dots"):
+        if production:            
+            venv_path = sys.prefix
+            gunicorn_path = os.path.join(venv_path, "bin", "gunicorn")
+            uvicorn_path = os.path.join(venv_path, "Scripts", "uvicorn.exe")
+
+            if platform.system() == "Windows":
+                server_path = uvicorn_path
+            else:
+                server_path = gunicorn_path
+
+            cmd = [server_path, f"{process_type}.main:app", "--workers", WORKERS]
+
+            if server_path == uvicorn_path:
+                cmd.extend(["--host", HOST, "--port", PORT])
+            else:
+                cmd.extend(["--bind", f"{HOST}:{PORT}"])
+
+            if process_type == "api" and server_path == gunicorn_path:
+                cmd.extend(["--worker-class", "uvicorn.workers.UvicornWorker"])
+            
+            if SSL_CERT and SSL_KEY:
+                cmd.extend(["--certfile", SSL_CERT, "--keyfile", SSL_KEY])
+        else:
+            # Development mode using Python module directly
+            cmd = [sys.executable, "-m", f"{process_type}.main"]
+
         process = subprocess.Popen(
-            [sys.executable, "-m", f"{process_type}.main"],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -163,18 +209,18 @@ def run_process(process_type, timeout=30, no_logs=False, max_log_size=1):
     if no_logs:
         log_thread = threading.Thread(
             target=log_output, 
-            args=(process, sys.stdout, process_type, success_event)
+            args=(process, sys.stdout, process_type, success_event, production)
         )
     else:
         # Use rotating log file instead of a simple file
         log_file = RotatingLogFile(default_log_path, max_size=max_log_size * 1024 * 1024)
         log_thread = threading.Thread(
             target=log_output, 
-            args=(process, log_file, process_type, success_event)
+            args=(process, log_file, process_type, success_event, production)
         )
 
     log_thread.start()
-    
+
     # Wait for success signal or timeout
     if not success_event.wait(timeout):
         process.kill()
@@ -184,16 +230,7 @@ def run_process(process_type, timeout=30, no_logs=False, max_log_size=1):
     
     return process, log_thread, log_file if not no_logs else None
 
-def log_output(process, log_file, process_type, success_event):
-    """
-    Unified logging function that handles both API and chatbot output parsing
-    Sets success_event when appropriate startup message is detected
-    
-    @param process: The subprocess to read output from
-    @param log_file: Either a file object, RotatingLogFile instance, or sys.stdout
-    @param process_type: Either 'api' or 'sample_chatbot'
-    @param success_event: Event to signal when startup is successful
-    """
+def log_output(process, log_file, process_type, success_event, production=False):
     urls = []
     version = None
     
@@ -203,41 +240,84 @@ def log_output(process, log_file, process_type, success_event):
             log_file.flush()
             
             if process_type == "api":
-                if "AI SDK Version" in line:
-                    version_match = re.search(r"Version:\s(.*)", line)
-                    if version_match:
-                        version = version_match.group(1)
-                        # If we already have the URL, print status and set success event
-                        if urls and not success_event.is_set():
-                            print_status("api", urls, version)
-                            success_event.set()
-                
-                if "Uvicorn running on" in line:
-                    match = re.search(r"Uvicorn running on (https?://[\w.:]+)", line)
-                    if match:
-                        urls.append(match.group(1))
-                        # If we already have version info, print status and set event
-                        if version is not None:
-                            print_status("api", urls, version)
-                            success_event.set()
-                        # If we don't have version yet, start a timer to wait for it
-                        elif not success_event.is_set():
-                            def delayed_status():
-                                if not success_event.is_set():
-                                    print_status("api", urls, version)
-                                    success_event.set()
-                            # Wait 5 seconds then print whatever we have
-                            t = threading.Timer(5.0, delayed_status)
-                            t.daemon = True
-                            t.start()
+                if production and platform.system() != "Windows":
+                    # Production mode patterns (Gunicorn)
+                    if "AI SDK Version" in line:
+                        version_match = re.search(r"Version:\s(.*)", line)
+                        if version_match:
+                            version = version_match.group(1)
+                            if urls and not success_event.is_set():
+                                print_status("api", urls, version)
+                                success_event.set()
+                    
+                    if "Listening at:" in line:
+                        match = re.search(r"Listening at: (https?://[\w.:]+)", line)
+                        if match:
+                            urls.append(match.group(1))
+                            if version is not None:
+                                print_status("api", urls, version)
+                                success_event.set()
+                            elif not success_event.is_set():
+                                def delayed_status():
+                                    if not success_event.is_set():
+                                        print_status("api", urls, version)
+                                        success_event.set()
+                                t = threading.Timer(5.0, delayed_status)
+                                t.daemon = True
+                                t.start()
+                else:
+                    # Development mode patterns (Uvicorn)
+                    if "AI SDK Version" in line:
+                        version_match = re.search(r"Version:\s(.*)", line)
+                        if version_match:
+                            version = version_match.group(1)
+                            if urls and not success_event.is_set():
+                                print_status("api", urls, version)
+                                success_event.set()
+                    
+                    if "Uvicorn running on" in line:
+                        match = re.search(r"Uvicorn running on (https?://[\w.:]+)", line)
+                        if match:
+                            urls.append(match.group(1))
+                            if version is not None:
+                                print_status("api", urls, version)
+                                success_event.set()
+                            elif not success_event.is_set():
+                                def delayed_status():
+                                    if not success_event.is_set():
+                                        print_status("api", urls, version)
+                                        success_event.set()
+                                t = threading.Timer(5.0, delayed_status)
+                                t.daemon = True
+                                t.start()
             
-            elif process_type == "sample_chatbot" and "Running on" in line:
-                match = re.search(r"Running on (https?://[\w.:]+)", line)
-                if match:
-                    urls.append(match.group(1))
-                    if not success_event.is_set():  # Only print status and set event once all URLs are collected
-                        print_status("sample_chatbot", urls)
-                        success_event.set()
+            elif process_type == "sample_chatbot":
+                if production and platform.system() != "Windows":
+                    # Production mode patterns (Gunicorn)
+                    if "Listening at:" in line:
+                        match = re.search(r"Listening at: (https?://[\w.:]+)", line)
+                        if match:
+                            urls.append(match.group(1))
+                            if not success_event.is_set():
+                                print_status("sample_chatbot", urls)
+                                success_event.set()
+                elif production and platform.system() == "Windows":
+                    if "running on" in line:
+                        match = re.search(r"running on (https?://[\w.:]+)", line)
+                        if match:
+                            urls.append(match.group(1))
+                            if not success_event.is_set():
+                                print_status("sample_chatbot", urls)
+                                success_event.set()
+                else:
+                    # Development mode patterns
+                    if "Running on" in line:
+                        match = re.search(r"Running on (https?://[\w.:]+)", line)
+                        if match:
+                            urls.append(match.group(1))
+                            if not success_event.is_set():
+                                print_status("sample_chatbot", urls)
+                                success_event.set()
                     
     except ValueError as e:
         if "I/O operation on closed file" in str(e):
@@ -327,6 +407,14 @@ if __name__ == "__main__":
     log_files = []
 
     print_header()
+    
+    # Show production mode warning if enabled
+    if args.production:
+        console.print(Panel(
+            "[bold yellow]Production mode uses Gunicorn ASGI server on UNIX systems and Uvicorn ASGI server on Windows.",
+            border_style="yellow",
+            width=60
+        ))
 
     try:
         if args.load_demo:
@@ -335,14 +423,14 @@ if __name__ == "__main__":
                 sys.exit(1)
 
         if args.mode in ["api", "both"]:
-            api_process, api_log_thread, api_log_file = run_process("api", args.timeout, args.no_logs, args.max_log_size)
+            api_process, api_log_thread, api_log_file = run_process("api", args.timeout, args.no_logs, args.max_log_size, args.production)
             processes.append(("API", api_process))
             log_threads.append(api_log_thread)
             if api_log_file:
                 log_files.append(api_log_file)
         
         if args.mode in ["sample_chatbot", "both"]:
-            chatbot_process, chatbot_log_thread, chatbot_log_file = run_process("sample_chatbot", args.timeout, args.no_logs, args.max_log_size)
+            chatbot_process, chatbot_log_thread, chatbot_log_file = run_process("sample_chatbot", args.timeout, args.no_logs, args.max_log_size, args.production)
             processes.append(("Chatbot", chatbot_process))
             log_threads.append(chatbot_log_thread)
             if chatbot_log_file:
@@ -368,6 +456,10 @@ if __name__ == "__main__":
         
     except TimeoutError as e:
         console.print(f"[bold red]Error:[/] {str(e)}")
+
+    except Exception as e:
+        console.print(f"[bold red]Error:[/] {e}")
+        sys.exit(1)
     
     finally:
         # Cleanup

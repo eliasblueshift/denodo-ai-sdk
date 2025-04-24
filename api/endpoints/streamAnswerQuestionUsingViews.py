@@ -10,7 +10,6 @@
 """
 
 import os
-import traceback
 
 from pydantic import BaseModel, Field
 from typing import Annotated, List, Literal
@@ -19,9 +18,9 @@ from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
+from api.utils.sdk_utils import timing_context, handle_endpoint_error
 
 router = APIRouter()
 security_basic = HTTPBasic(auto_error = False)
@@ -61,6 +60,7 @@ class streamAnswerQuestionUsingViewsRequest(BaseModel):
         '/streamAnswerQuestionUsingViews',
         response_class = StreamingResponse,
         tags = ['Ask a Question - Streaming - Custom Vector Store'])
+@handle_endpoint_error("streamAnswerQuestionUsingViews")
 async def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
     """
     The only difference between this endpoint and `streamAnswerQuestion` is that this endpoint 
@@ -83,42 +83,35 @@ async def streamAnswerQuestionUsingViews(endpoint_request: streamAnswerQuestionU
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
     is a complex task that should be handled with a powerful LLM."""
 
-    try:
-        timings = {}
-        with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
-                query=endpoint_request.question, 
-                vector_search_tables=endpoint_request.vector_search_tables, 
-                llm_provider=endpoint_request.chat_provider,
-                llm_model=endpoint_request.chat_model,
-                mode=endpoint_request.mode,
-                custom_instructions=endpoint_request.custom_instructions
-            )
+    timings = {}
+    with timing_context("llm_time", timings):
+        category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
+            query=endpoint_request.question, 
+            vector_search_tables=endpoint_request.vector_search_tables, 
+            llm_provider=endpoint_request.chat_provider,
+            llm_model=endpoint_request.chat_model,
+            mode=endpoint_request.mode,
+            custom_instructions=endpoint_request.custom_instructions
+        )
 
-        if category == "SQL":
-            response = await sdk_answer_question.process_sql_category(
-                request=endpoint_request, 
-                vector_search_tables=endpoint_request.vector_search_tables, 
-                category_response=category_response,
-                auth=auth, 
-                timings=timings,
-            )
-        elif category == "METADATA":
-            response = await sdk_answer_question.process_metadata_category(
-                category_response=category_response, 
-                category_related_questions=category_related_questions, 
-                vector_search_tables=endpoint_request.vector_search_tables, 
-                timings=timings,
-            )
-        else:
-            response = sdk_answer_question.process_unknown_category(timings=timings)
+    if category == "SQL":
+        response = await sdk_answer_question.process_sql_category(
+            request=endpoint_request, 
+            vector_search_tables=endpoint_request.vector_search_tables, 
+            category_response=category_response,
+            auth=auth, 
+            timings=timings,
+        )
+    elif category == "METADATA":
+        response = await sdk_answer_question.process_metadata_category(
+            category_response=category_response, 
+            category_related_questions=category_related_questions, 
+            vector_search_tables=endpoint_request.vector_search_tables, 
+            timings=timings,
+        )
+    else:
+        response = sdk_answer_question.process_unknown_category(timings=timings)
 
-        def generator():
-            yield from response.get('answer', 'Error processing the question.')
-        return StreamingResponse(generator(), media_type = 'text/plain')
-    except Exception as e:
-        error_details = {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-        raise HTTPException(status_code=500, detail=error_details)
+    def generator():
+        yield from response.get('answer', 'Error processing the question.')
+    return StreamingResponse(generator(), media_type = 'text/plain')

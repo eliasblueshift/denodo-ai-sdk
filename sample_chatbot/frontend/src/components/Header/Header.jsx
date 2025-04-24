@@ -1,13 +1,32 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import Container from "react-bootstrap/Container";
 import Navbar from "react-bootstrap/Navbar";
 import Button from "react-bootstrap/Button";
 import axios from "axios";
 import VectorDBSyncModal from '../VectorDBSyncModal';
+import CustomInstructionsModal from '../CustomInstructionsModal';
 
 const Header = ({ isAuthenticated, setIsAuthenticated, handleClearResults, showClearButton, onLoadCSV }) => {
   const [customLogoFailed, setCustomLogoFailed] = useState(false);
   const [showVectorDBSync, setShowVectorDBSync] = useState(false);
+  const [showCustomInstructions, setShowCustomInstructions] = useState(false);
+  const [config, setConfig] = useState({ hasAISDKCredentials: false, unstructuredMode: false });
+
+  useEffect(() => {
+    // Fetch configuration when component mounts
+    const fetchConfig = async () => {
+      try {
+        const response = await axios.get('/api/config');
+        setConfig(response.data);
+      } catch (error) {
+        console.error('Error fetching config:', error);
+      }
+    };
+
+    if (isAuthenticated) {
+      fetchConfig();
+    }
+  }, [isAuthenticated]);
 
   const handleLogoError = () => {
     setCustomLogoFailed(true);
@@ -77,22 +96,35 @@ const Header = ({ isAuthenticated, setIsAuthenticated, handleClearResults, showC
             {isAuthenticated && (
               <>
                 <Button 
-                  variant="secondary"
-                  size="sm"
-                  onClick={onLoadCSV}
-                  bsPrefix="btn"
-                  className="me-2">
-                  Load Unstructured CSV
-                </Button>
-                <Button 
                   variant="secondary" 
                   bsPrefix="btn"
                   size="sm" 
-                  onClick={() => setShowVectorDBSync(true)} 
+                  onClick={() => setShowCustomInstructions(true)} 
                   className="me-2"
                 >
-                  Sync VectorDB
+                  Profile
                 </Button>
+                {config.unstructuredMode && (
+                  <Button 
+                    variant="secondary"
+                    size="sm"
+                    onClick={onLoadCSV}
+                    bsPrefix="btn"
+                    className="me-2">
+                    Load Unstructured CSV
+                  </Button>
+                )}
+                {config.hasAISDKCredentials && (
+                  <Button 
+                    variant="secondary" 
+                    bsPrefix="btn"
+                    size="sm" 
+                    onClick={() => setShowVectorDBSync(true)} 
+                    className="me-2"
+                  >
+                    Sync VectorDB
+                  </Button>
+                )}
                 <Button
                   variant="danger"
                   size="sm"
@@ -109,6 +141,10 @@ const Header = ({ isAuthenticated, setIsAuthenticated, handleClearResults, showC
       <VectorDBSyncModal 
         show={showVectorDBSync} 
         handleClose={() => setShowVectorDBSync(false)} 
+      />
+      <CustomInstructionsModal
+        show={showCustomInstructions}
+        handleClose={() => setShowCustomInstructions(false)}
       />
     </>
   );

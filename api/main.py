@@ -20,13 +20,11 @@ from api.endpoints import (
     answerQuestion,
     answerQuestionUsingViews,
     answerDataQuestion,
-    answerMetadataQuestion,
+    answerMetadataQuestion
 )
 
 required_vars = [
     "DATA_CATALOG_URL",
-    "DATA_CATALOG_METADATA_USER",
-    "DATA_CATALOG_METADATA_PWD",
     "QUERY_TO_VQL",
     "ANSWER_VIEW",
     "SQL_CATEGORY",
@@ -53,10 +51,13 @@ check_env_variables(required_vars)
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
-    format='%(asctime)s [Worker %(process)d] %(levelname)-8s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
+    format='[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S %z',
     encoding='utf-8'
 )
+
+# Suppress matplotlib font warnings for graph generation
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 
 log_config = configure_uvicorn_logging()
 
@@ -74,6 +75,7 @@ AI_SDK_EMBEDDINGS_PROVIDER = os.getenv("EMBEDDINGS_PROVIDER")
 AI_SDK_EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL")
 AI_SDK_VECTOR_STORE_PROVIDER = os.getenv("VECTOR_STORE")
 AI_SDK_VDB_NAMES = [db.strip() for db in os.getenv("VDB_NAMES", "").split(",")]
+AI_SDK_TAG_NAMES = [tag.strip() for tag in os.getenv("VDB_TAGS", "").split(",")]
 AI_SDK_DATA_CATALOG_URL = os.getenv("DATA_CATALOG_URL")
 AI_SDK_DATA_CATALOG_VERIFY_SSL = bool(int(os.getenv("DATA_CATALOG_VERIFY_SSL", 0)))
 
@@ -81,13 +83,12 @@ AI_SDK_DATA_CATALOG_VERIFY_SSL = bool(int(os.getenv("DATA_CATALOG_VERIFY_SSL", 0
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def log_ai_sdk_parameters():
-    """Log AI SDK parameters and data catalog connection status."""
     ai_sdk_params = {
         "OS": platform.platform(),
         "AI SDK Host": AI_SDK_HOST,
         "AI SDK Port": AI_SDK_PORT,
-        "AI SDK Workers": AI_SDK_WORKERS,
         "AI SDK Version": AI_SDK_VERSION,
+        "AI SDK Workers": AI_SDK_WORKERS,
         "Using SSL": bool(AI_SDK_SSL_KEY and AI_SDK_SSL_CERT),
         "Chat Provider": AI_SDK_CHAT_PROVIDER,
         "Chat Model": AI_SDK_CHAT_MODEL,
@@ -96,7 +97,8 @@ def log_ai_sdk_parameters():
         "Embeddings Provider": AI_SDK_EMBEDDINGS_PROVIDER,
         "Embeddings Model": AI_SDK_EMBEDDINGS_MODEL,
         "Vector Store Provider": AI_SDK_VECTOR_STORE_PROVIDER,
-        "VDB Names": AI_SDK_VDB_NAMES,
+        "Database Names": AI_SDK_VDB_NAMES,
+        "Tag Names": AI_SDK_TAG_NAMES,
         "Data Catalog URL": AI_SDK_DATA_CATALOG_URL,
         "Data Catalog Connection": test_data_catalog_connection(AI_SDK_DATA_CATALOG_URL, AI_SDK_DATA_CATALOG_VERIFY_SSL),
         "Data Catalog Verify SSL": AI_SDK_DATA_CATALOG_VERIFY_SSL,
@@ -108,7 +110,7 @@ def log_ai_sdk_parameters():
 
     if not ai_sdk_params["Data Catalog Connection"]:
         logging.warning("Could not establish connection to Data Catalog. Please check your configuration.")
-    
+
     return ai_sdk_params["Data Catalog Connection"]
 
 tags = [
@@ -165,9 +167,9 @@ app.include_router(answerDataQuestion.router)
 app.include_router(answerMetadataQuestion.router)
 app.include_router(answerQuestionUsingViews.router)
 
+log_ai_sdk_parameters()
+
 if __name__ == "__main__":
-    log_ai_sdk_parameters()
-    
     uvicorn.run(
         "api.main:app",
         host = AI_SDK_HOST,
@@ -175,6 +177,6 @@ if __name__ == "__main__":
         ssl_keyfile = AI_SDK_SSL_KEY,
         ssl_certfile = AI_SDK_SSL_CERT,
         log_config = log_config,
-        log_level = "info",
+        log_level = logging.INFO,
         workers = AI_SDK_WORKERS
     )

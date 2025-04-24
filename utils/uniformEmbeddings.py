@@ -1,4 +1,5 @@
 import os
+import httpx
 import logging
 
 from langchain.storage import LocalFileStore
@@ -31,7 +32,6 @@ class UniformEmbeddings:
             logging.info(f"- {self.provider_name.upper()}_BASE_URL (required)")
             logging.info(f"- {self.provider_name.upper()}_PROXY (optional)")
             self.setup_custom()
-            return
 
         if self.provider_name.lower() == "openai":
             self.setup_openai()
@@ -115,7 +115,7 @@ class UniformEmbeddings:
 
         api_key = os.getenv('OPENAI_API_KEY')
         base_url = os.getenv('OPENAI_BASE_URL')
-        proxy = os.getenv('OPENAI_PROXY')
+        proxy = os.getenv('OPENAI_PROXY_URL')
         organization_id = os.getenv('OPENAI_ORG_ID')
         dimensions = os.getenv('OPENAI_EMBEDDINGS_DIMENSIONS')
         
@@ -132,7 +132,11 @@ class UniformEmbeddings:
             kwargs["openai_api_base"] = base_url
 
         if proxy is not None:
-            kwargs["openai_proxy"] = proxy
+            _http_client = httpx.Client(proxy = proxy, verify = False)
+            _http_async_client = httpx.AsyncClient(proxy = proxy, verify = False)
+
+            kwargs["http_client"] = _http_client
+            kwargs["http_async_client"] = _http_async_client
 
         if organization_id is not None:
             kwargs["organization"] = organization_id
@@ -170,7 +174,11 @@ class UniformEmbeddings:
             logging.warning("AzureOpenAI API key not set. Using proxy for authentication.")
 
         if api_proxy is not None:
-            kwargs["openai_proxy"] = api_proxy
+            _http_client = httpx.Client(proxy = api_proxy, verify = False)
+            _http_async_client = httpx.AsyncClient(proxy = api_proxy, verify = False)
+
+            kwargs["http_client"] = _http_client
+            kwargs["http_async_client"] = _http_async_client
         else:
             logging.warning("AzureOpenAI proxy not set. Using API key for authentication.")
 

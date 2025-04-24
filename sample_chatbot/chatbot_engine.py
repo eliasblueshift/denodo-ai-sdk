@@ -1,12 +1,13 @@
+import uuid
 import inspect
 import traceback
 import logging
 import random
 
-from utils.utils import add_langfuse_callback, generate_langfuse_session_id, custom_tag_parser
 from langchain_core.output_parsers import StrOutputParser
-from sample_chatbot.chatbot_utils import process_tool_query, add_to_chat_history, readable_tool_result, parse_xml_tags
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from utils.utils import add_langfuse_callback, generate_langfuse_session_id, custom_tag_parser
+from sample_chatbot.chatbot_utils import process_tool_query, add_to_chat_history, readable_tool_result, parse_xml_tags, trim_conversation, setup_user_details
 
 RELATED_QUESTIONS_PROMPT = """
 After I have answered the user's query, I will also provide a list of 3 related questions in plain text format (no markdown) that the user might ask next.
@@ -14,7 +15,7 @@ The questions should be closely related to the current conversation and should n
 - Return each related question in between <related_question></related_question> tags. I will now answer:"""
 
 class ChatbotEngine:
-    def __init__(self, llm, system_prompt, tool_selection_prompt, tools, api_host, username, password, vector_store_provider, denodo_tables, message_history = 4):
+    def __init__(self, llm, system_prompt, tool_selection_prompt, tools, api_host, username, password, vector_store_provider, denodo_tables, message_history = 4, user_details = ""):
         self.llm = llm.llm
         self.llm_callback = llm.callback
         self.llm_model = f"{llm.provider_name}.{llm.model_name}"
@@ -30,10 +31,11 @@ class ChatbotEngine:
         self.password = password
         self.wait_phrases = ["Give me a second", "Please wait", "Hold on", "Just a moment", "I'm working on it", "I'm looking into it", "I'm checking it out", "I'm on it"]
         self.denodo_tables = denodo_tables
+        self.user_details = setup_user_details(user_details)
         self.tools_prompt = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
             MessagesPlaceholder("chat_history", n_messages=self.message_history),
-            ("human", "{input}" + self.tool_selection_prompt + "\n\n{force_tool}"),
+            ("human", "{input}\n\n{force_tool}" + self.tool_selection_prompt + "\n\n{force_tool}"),
         ])
 
         self.answer_with_tool_prompt = ChatPromptTemplate.from_messages([
@@ -62,12 +64,13 @@ class ChatbotEngine:
         else:
             tool = None
         try:
-            force_tool = f"In this case, I will use tool {tool}..." if tool else ""
+            force_tool = f"I want you to use the tool {tool} for this query." if tool else ""
             first_input = self.tool_selection_chain.invoke(
                 {"input": query,
                  "chat_history": self.chat_history,
                  "force_tool": force_tool,
-                 "denodo_tables": self.denodo_tables},
+                 "denodo_tables": self.denodo_tables,
+                 "user_details": self.user_details},
                 config={
                     "callbacks": add_langfuse_callback(self.llm_callback, self.llm_model, self.session_id),
                     "run_name": inspect.currentframe().f_code.co_name,
@@ -82,11 +85,11 @@ class ChatbotEngine:
                         if tool_name == "database_query":
                             natural_language_query = parsed_query["database_query"]["natural_language_query"]
                             yield "<TOOL:data>"
-                            yield f"Querying Denodo for: **{natural_language_query}**. {random.choice(self.wait_phrases)}.\n\n"
+                            yield f"Querying the Denodo AI SDK for: **{natural_language_query}**. {random.choice(self.wait_phrases)}.\n\n"
                         elif tool_name == "metadata_query":
                             search_query = parsed_query["metadata_query"]["search_query"]
                             yield "<TOOL:metadata>"
-                            yield f"Querying Denodo for: **{search_query}**. {random.choice(self.wait_phrases)}.\n\n"
+                            yield f"Querying the Denodo AI SDK for: **{search_query}**. {random.choice(self.wait_phrases)}. Please note that the Metadata Tool works with similarity search (n = 5) and not exact match. For exact search, please use the Denodo Data Catalog.\n\n"
                         elif tool_name == "kb_lookup":
                             yield "<TOOL:kb>"
                         else:
@@ -103,6 +106,7 @@ class ChatbotEngine:
                     "chat_history": self.chat_history,
                     "tool_query": readable_tool_output,
                     "denodo_tables": self.denodo_tables,
+                    "user_details": self.user_details
                 },
                 config = {
                     "callbacks": add_langfuse_callback(self.llm_callback, self.llm_model, self.session_id),
@@ -114,49 +118,58 @@ class ChatbotEngine:
             
             ai_response = ""
             buffer = ""
-            streaming_buffer = True
+            streaming = True
             
             for chunk in ai_stream:
                 ai_response += chunk
                 
-                if streaming_buffer and '<' in chunk:
-                    streaming_buffer = False
+                if streaming and '<' in chunk:
+                    streaming = False
                     buffer = chunk
-                elif streaming_buffer:
+                elif streaming:
                     yield chunk
                 else:
                     buffer += chunk
 
-            pre_buffer = buffer.split('<', 1)
-            yield pre_buffer[0]
+            pre_buffer = buffer.split('<related_question>', 1)
+            
+            if pre_buffer and len(pre_buffer) > 0:
+                yield pre_buffer[0].rstrip()
+            else:
+                yield ""  # Yield empty string if pre_buffer is empty or None
 
             if len(pre_buffer) > 1:
-                buffer = '<' + pre_buffer[1]
+                buffer = '<related_question>' + pre_buffer[1]
                 # Parse related questions from the final buffer if it contains any
                 if '<related_question>' in buffer:
                     related_questions = custom_tag_parser(buffer, 'related_question')
+                    # Sometimes the LLM escapes the underscore character
+                    related_questions = [question.replace('\\_', '_') for question in related_questions]
             else:
                 related_questions = []
     
             return_data = {
-                "vql": None,
+                "uuid": str(uuid.uuid4()),
+                "vql": '',
                 "data_sources": self.llm_model,
                 "embeddings": None,
                 "related_questions": related_questions,
                 "execution_result": None,
-                "total_tokens": 0,
+                "tokens": 0,
                 "answer": ai_response
             }
 
             if tool_name == "database_query" and isinstance(tool_output, dict):
-                return_data["vql"] = tool_output["sql_query"]
-                return_data["execution_result"] = tool_output["execution_result"]
-                return_data["graph"] = tool_output["raw_graph"]
-                return_data["tables_used"] = tool_output["tables_used"]
-                return_data["query_explanation"] = tool_output["query_explanation"]
+                return_data["vql"] = tool_output.get("sql_query", "")
+                return_data["execution_result"] = tool_output.get("execution_result", "")
+                return_data["graph"] = tool_output.get("raw_graph", "")
+                return_data["tables_used"] = tool_output.get("tables_used", [])
+                return_data["query_explanation"] = tool_output.get("query_explanation", "")
+                return_data["tokens"] = tool_output.get("tokens", {}).get("total_tokens", 0)
+                return_data["ai_sdk_time"] = tool_output.get("total_execution_time", 0)
             elif tool_name == "kb_lookup":
                 return_data["data_sources"] = self.vector_store_provider
-
+                
             logging.info(f"Return data: {return_data}")
 
             yield return_data
@@ -170,8 +183,7 @@ class ChatbotEngine:
                 original_xml_call = original_xml_call
             )
             
-            if len(self.chat_history) > 10:
-                self.chat_history = self.chat_history[-10:]
+            self.chat_history = trim_conversation(self.chat_history)
         except Exception as e:
             error_message = f"An error occurred: {str(e)}"
             traceback_info = traceback.format_exc()

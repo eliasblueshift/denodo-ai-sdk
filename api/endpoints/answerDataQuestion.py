@@ -10,7 +10,6 @@
 """
 
 import os
-import traceback
 
 from pydantic import BaseModel
 from typing import Dict, Annotated, List
@@ -20,7 +19,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context, add_tokens, generate_session_id
+from api.utils.sdk_utils import timing_context, add_tokens, generate_session_id, handle_endpoint_error
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
@@ -57,6 +56,7 @@ class answerDataQuestionRequest(BaseModel):
     custom_instructions: str = os.getenv('CUSTOM_INSTRUCTIONS', '')
     markdown_response: bool = True
     vector_search_k: int = 5
+    vector_search_sample_data_k: int = 3
     disclaimer: bool = True
     verbose: bool = True
 
@@ -80,6 +80,7 @@ class answerDataQuestionResponse(BaseModel):
         response_model = answerDataQuestionResponse,
         tags = ['Ask a Question']
 )
+@handle_endpoint_error("answerDataQuestion")
 async def answer_data_question_get(
     request: answerDataQuestionRequest = Depends(),
     auth: str = Depends(authenticate)
@@ -111,6 +112,7 @@ async def answer_data_question_get(
         response_class = JSONResponse,
         response_model = answerDataQuestionResponse,
         tags = ['Ask a Question'])
+@handle_endpoint_error("answerDataQuestion")
 async def answer_data_question_post(
     endpoint_request: answerDataQuestionRequest,
     auth: str = Depends(authenticate)
@@ -139,51 +141,43 @@ async def answer_data_question_post(
 
 async def process_data_question(request_data: answerDataQuestionRequest, auth: str):
     """Main function to process the data question and return the answer"""
-    try:
-        # Generate session ID for Langfuse debugging purposes
-        session_id = generate_session_id(request_data.question)
+    # Generate session ID for Langfuse debugging purposes
+    session_id = generate_session_id(request_data.question)
 
-        vector_search_tables, timings = await sdk_ai_tools.get_relevant_tables(
-            query=request_data.question,
-            embeddings_provider=request_data.embeddings_provider,
-            embeddings_model=request_data.embeddings_model,
-            vector_store_provider=request_data.vector_store_provider,
-            vdb_list=request_data.vdp_database_names,
-            tag_list=request_data.vdp_tag_names,
-            auth=auth,
-            k=request_data.vector_search_k,
-            use_views=request_data.use_views,
-            expand_set_views=request_data.expand_set_views
-        )
+    vector_search_tables, sample_data, timings = await sdk_ai_tools.get_relevant_tables(
+        query=request_data.question,
+        embeddings_provider=request_data.embeddings_provider,
+        embeddings_model=request_data.embeddings_model,
+        vector_store_provider=request_data.vector_store_provider,
+        vdb_list=request_data.vdp_database_names,
+        tag_list=request_data.vdp_tag_names,
+        auth=auth,
+        k=request_data.vector_search_k,
+        use_views=request_data.use_views,
+        expand_set_views=request_data.expand_set_views,
+        vector_search_sample_data_k=request_data.vector_search_sample_data_k
+    )
 
-        with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
-                query=request_data.question, 
-                vector_search_tables=vector_search_tables, 
-                llm_provider=request_data.chat_provider,
-                llm_model=request_data.chat_model,
-                mode="data",
-                custom_instructions=request_data.custom_instructions,
-                session_id=session_id
-            )
-
-        response = await sdk_answer_question.process_sql_category(
-            request=request_data, 
+    with timing_context("llm_time", timings):
+        category, category_response, category_related_questions, sql_category_tokens = await sdk_ai_tools.sql_category(
+            query=request_data.question, 
             vector_search_tables=vector_search_tables, 
-            category_response=category_response,
-            auth=auth, 
-            timings=timings,
+            llm_provider=request_data.chat_provider,
+            llm_model=request_data.chat_model,
+            mode="data",
+            custom_instructions=request_data.custom_instructions,
             session_id=session_id
         )
 
-        response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
+    response = await sdk_answer_question.process_sql_category(
+        request=request_data, 
+        vector_search_tables=vector_search_tables, 
+        category_response=category_response,
+        auth=auth, 
+        timings=timings,
+        session_id=session_id,
+        sample_data=sample_data
+    )
 
-        return JSONResponse(content=jsonable_encoder(response), media_type='application/json')
-    except Exception as e:
-
-        error_details = {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-        raise HTTPException(status_code=500, detail=error_details)
+    response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
+    return JSONResponse(content=jsonable_encoder(response), media_type='application/json')

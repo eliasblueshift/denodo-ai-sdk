@@ -40,10 +40,11 @@ const App = () => {
     }
   };
 
-  const handleCSVUpload = async (file, description) => {
+  const handleCSVUpload = async (file, description, delimiter = ';') => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('description', description);
+    formData.append('delimiter', delimiter);
 
     try {
       const response = await axios.post('/update_csv', formData, {

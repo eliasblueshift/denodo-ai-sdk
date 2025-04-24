@@ -51,6 +51,9 @@ const useSDK = (setResults) => {
                       tables_used: jsonData.tables_used,
                       context: context,
                       relatedTables: relatedTables,
+                      tokens: jsonData.tokens,
+                      ai_sdk_time: jsonData.ai_sdk_time,
+                      uuid: jsonData.uuid,
                       ...(jsonData.graph && { graph: jsonData.graph }),
                     }
                   : result

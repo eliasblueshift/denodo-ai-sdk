@@ -10,7 +10,6 @@
 """
 
 import os
-import traceback
 
 from pydantic import BaseModel, Field
 from typing import Annotated, Literal
@@ -19,9 +18,9 @@ from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
+from api.utils.sdk_utils import timing_context, handle_endpoint_error
 
 router = APIRouter()
 security_basic = HTTPBasic(auto_error = False)
@@ -65,6 +64,7 @@ class streamAnswerQuestionRequest(BaseModel):
         response_class=StreamingResponse,
         tags = ['Ask a Question - Streaming']
 )
+@handle_endpoint_error("streamAnswerQuestion")
 async def stream_answer_question_get(request: streamAnswerQuestionRequest = Depends(), auth: str = Depends(authenticate)):
     """This endpoint processes a natural language question and:
 
@@ -95,6 +95,7 @@ async def stream_answer_question_get(request: streamAnswerQuestionRequest = Depe
         '/streamAnswerQuestion',
         response_class = StreamingResponse,
         tags = ['Ask a Question - Streaming'])
+@handle_endpoint_error("streamAnswerQuestion")
 async def stream_answer_question_post(endpoint_request: streamAnswerQuestionRequest, auth: str = Depends(authenticate)):
     """This endpoint processes a natural language question and:
 
@@ -123,56 +124,49 @@ async def stream_answer_question_post(endpoint_request: streamAnswerQuestionRequ
 
 async def process_stream_question(request_data: streamAnswerQuestionRequest, auth: str):
     """Main function to process the question and stream the answer"""
-    try:
-        vector_search_tables, timings = await sdk_ai_tools.get_relevant_tables(
-            query=request_data.question,
-            embeddings_provider=request_data.embeddings_provider,
-            embeddings_model=request_data.embeddings_model,
-            vector_store_provider=request_data.vector_store_provider,
-            vdb_list=request_data.vdp_database_names,
-            tag_list=request_data.vdp_tag_names,
-            auth=auth,
-            k=request_data.vector_search_k,
-            use_views=request_data.use_views,
-            expand_set_views=request_data.expand_set_views
+    vector_search_tables, sample_data, timings = await sdk_ai_tools.get_relevant_tables(
+        query=request_data.question,
+        embeddings_provider=request_data.embeddings_provider,
+        embeddings_model=request_data.embeddings_model,
+        vector_store_provider=request_data.vector_store_provider,
+        vdb_list=request_data.vdp_database_names,
+        tag_list=request_data.vdp_tag_names,
+        auth=auth,
+        k=request_data.vector_search_k,
+        use_views=request_data.use_views,
+        expand_set_views=request_data.expand_set_views,
+        vector_search_sample_data_k=request_data.vector_search_sample_data_k
+    )
+
+    with timing_context("llm_time", timings):
+        category, category_response, category_related_questions, _ = await sdk_ai_tools.sql_category(
+            query=request_data.question, 
+            vector_search_tables=vector_search_tables, 
+            llm_provider=request_data.chat_provider,
+            llm_model=request_data.chat_model,
+            mode=request_data.mode,
+            custom_instructions=request_data.custom_instructions
         )
 
-        with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, _ = await sdk_ai_tools.sql_category(
-                query=request_data.question, 
-                vector_search_tables=vector_search_tables, 
-                llm_provider=request_data.chat_provider,
-                llm_model=request_data.chat_model,
-                mode=request_data.mode,
-                custom_instructions=request_data.custom_instructions
-            )
+    if category == "SQL":
+        response = await sdk_answer_question.process_sql_category(
+            request=request_data, 
+            vector_search_tables=vector_search_tables, 
+            category_response=category_response,
+            auth=auth, 
+            timings=timings,
+            sample_data=sample_data
+        )
+    elif category == "METADATA":
+        response = await sdk_answer_question.process_metadata_category(
+            category_response=category_response, 
+            category_related_questions=category_related_questions, 
+            vector_search_tables=vector_search_tables, 
+            timings=timings,
+        )
+    else:
+        response = sdk_answer_question.process_unknown_category(timings=timings)
 
-        if category == "SQL":
-            response = await sdk_answer_question.process_sql_category(
-                request=request_data, 
-                vector_search_tables=vector_search_tables, 
-                category_response=category_response,
-                auth=auth, 
-                timings=timings,
-            )
-        elif category == "METADATA":
-            response = await sdk_answer_question.process_metadata_category(
-                category_response=category_response, 
-                category_related_questions=category_related_questions, 
-                vector_search_tables=vector_search_tables, 
-                timings=timings,
-            )
-        else:
-            response = sdk_answer_question.process_unknown_category(timings=timings)
-
-        def generator():
-            yield from response.get('answer', 'Error processing the question.')
-        return StreamingResponse(generator(), media_type = 'text/plain')
-    except Exception as e:
-
-        error_details = {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-        raise HTTPException(status_code=500, detail=error_details)
+    def generator():
+        yield from response.get('answer', 'Error processing the question.')
+    return StreamingResponse(generator(), media_type = 'text/plain')

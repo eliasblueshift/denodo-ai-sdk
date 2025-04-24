@@ -10,7 +10,6 @@
 """
 import os
 import json
-import traceback
 
 from pydantic import BaseModel
 from typing import List, Annotated
@@ -22,7 +21,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationC
 
 from utils.data_catalog import get_allowed_view_ids
 from utils.uniformVectorStore import UniformVectorStore
-from api.utils.sdk_utils import filter_non_allowed_associations
+from api.utils.sdk_utils import filter_non_allowed_associations, handle_endpoint_error
 
 router = APIRouter()
 security_basic = HTTPBasic(auto_error = False)
@@ -51,70 +50,60 @@ class similaritySearchRequest(BaseModel):
 
 class similaritySearchResponse(BaseModel):
     views: List[str]
-
+    
 @router.get(
         '/similaritySearch',
         response_class = JSONResponse,
         response_model = similaritySearchResponse,
         tags = ['Vector Store'])
+@handle_endpoint_error("similaritySearch")
 async def similaritySearch(endpoint_request: similaritySearchRequest = Depends(), auth: str = Depends(authenticate)):
     """
     This endpoint performs a similarity search on the vector database specified in the request.
     The vector store MUST have been previously populated with the metadata of the views in the vector database
     using getMetadata endpoint.
     """
-    try:
-        vdp_database_names = [db.strip() for db in endpoint_request.vdp_database_names.split(',')] if endpoint_request.vdp_database_names else []
-        vdp_tag_names = [tag.strip() for tag in endpoint_request.vdp_tag_names.split(',')] if endpoint_request.vdp_tag_names else []
+    vdp_database_names = [db.strip() for db in endpoint_request.vdp_database_names.split(',')] if endpoint_request.vdp_database_names else []
+    vdp_tag_names = [tag.strip() for tag in endpoint_request.vdp_tag_names.split(',')] if endpoint_request.vdp_tag_names else []
 
-        vector_store = UniformVectorStore(
-            provider=endpoint_request.vector_store_provider,
-            embeddings_provider=endpoint_request.embeddings_provider,
-            embeddings_model=endpoint_request.embeddings_model,
-        )
+    vector_store = UniformVectorStore(
+        provider=endpoint_request.vector_store_provider,
+        embeddings_provider=endpoint_request.embeddings_provider,
+        embeddings_model=endpoint_request.embeddings_model,
+    )
 
-        if not vdp_database_names and not vdp_tag_names:
-            vdp_database_names = vector_store.get_database_names()
-            vdp_tag_names = vector_store.get_tag_names()
+    search_params = {
+        "query": endpoint_request.query,
+        "k": endpoint_request.n_results,
+        "scores": endpoint_request.scores,
+        "database_names": vdp_database_names,
+        "tag_names": vdp_tag_names,
+    }
 
-        search_params = {
-            "query": endpoint_request.query,
-            "k": endpoint_request.n_results,
-            "scores": endpoint_request.scores,
-            "database_names": vdp_database_names,
-            "tag_names": vdp_tag_names
-        }
+    valid_view_ids = await get_allowed_view_ids(auth = auth)
+    valid_view_ids = [str(view_id) for view_id in valid_view_ids]
+    search_params["view_ids"] = valid_view_ids
 
-        valid_view_ids = await get_allowed_view_ids(auth = auth, database_names = vdp_database_names, tag_names = vdp_tag_names)
-        valid_view_ids = [str(view_id) for view_id in valid_view_ids]
-        search_params["view_ids"] = valid_view_ids
+    search_results = vector_store.search(**search_params)
 
-        search_results = vector_store.search(**search_params)
+    output = {
+        "views": [
+            {
+                "view_name": (result[0] if endpoint_request.scores else result).metadata["view_name"],
+                "view_json": (
+                    filter_non_allowed_associations(
+                        json.loads((result[0] if endpoint_request.scores else result).metadata["view_json"]),
+                        valid_view_ids
+                    )
+                ),
+                "view_text": (result[0] if endpoint_request.scores else result).page_content,
+                "database_name": (result[0] if endpoint_request.scores else result).metadata["database_name"],
+                **{key: (result[0] if endpoint_request.scores else result).metadata[key] 
+                    for key in (result[0] if endpoint_request.scores else result).metadata 
+                    if key.startswith('tag_')},
+                **({"scores": result[1]} if endpoint_request.scores else {})
+            } for result in search_results
+        ]
+    }
 
-        output = {
-            "views": [
-                {
-                    "view_name": (result[0] if endpoint_request.scores else result).metadata["view_name"],
-                    "view_json": (
-                        filter_non_allowed_associations(
-                            json.loads((result[0] if endpoint_request.scores else result).metadata["view_json"]),
-                            valid_view_ids
-                        )
-                    ),
-                    "view_text": (result[0] if endpoint_request.scores else result).page_content,
-                    "database_name": (result[0] if endpoint_request.scores else result).metadata["database_name"],
-                    "tag_names": (result[0] if endpoint_request.scores else result).metadata["tag_names"],
-                    **({"scores": result[1]} if endpoint_request.scores else {})
-                } for result in search_results
-            ]
-        }
-
-        return JSONResponse(content = jsonable_encoder(output), media_type = "application/json")
-    except Exception as e:
-
-        error_details = {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-        raise HTTPException(status_code=500, detail=error_details)
+    return JSONResponse(content = jsonable_encoder(output), media_type = "application/json")

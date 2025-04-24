@@ -1,78 +1,60 @@
-import requests
-from sample_chatbot.chatbot_utils import timed
+from sample_chatbot.chatbot_utils import timed, make_ai_sdk_request
     
 @timed
-def kb_lookup(search_query, vector_store, k = 10, result_limit = 10000):
+def kb_lookup(search_query, vector_store, k = 5, result_limit = 10000):
     result = vector_store.search(query = search_query, k = k, scores = False)
     information = [f"Result {i+1}: {document.page_content[:result_limit]}\n" for i, document in enumerate(result)]
     information = '\n'.join(information)
     return information
 
 @timed
-def metadata_query(search_query, api_host, username, password, k = 5):
-    request_params = {
+def metadata_query(search_query, api_host, username, password, database_names = None, tag_names = None, k = 5):
+    request_body = {
         'query': search_query,
-        'n_results': k
+        'n_results': k,
     }
-
-    try:
-        response = requests.get(
-            f'{api_host}/similaritySearch',
-            params=request_params,
-            auth=(username, password),
-            verify=False
-        )
-        response.raise_for_status()
-        json_data = response.json()
-        
-        if 'views' in json_data:
-            return [entry.get('view_json', {}) for entry in json_data['views']]
-        return json_data
-    except requests.HTTPError as e:
-        if e.response.status_code == 401:
-            return "Authentication failed. Please check your Denodo Data Catalog credentials."
-        else:
-            return f"An unexpected error occurred when connecting to VDP: {e}"
-    except Exception as e:
-        return f"Failed to lookup the Denodo database: {e}"
     
+    if database_names:
+        request_body['vdp_database_names'] = ",".join(database_names)
+    if tag_names:
+        request_body['vdp_tag_names'] = ",".join(tag_names)
+
+    endpoint = f'{api_host}/similaritySearch'
+    response = make_ai_sdk_request(endpoint, request_body, (username, password), "GET")
+    
+    if isinstance(response, dict) and 'views' in response:
+        return [entry.get('view_json', {}) for entry in response['views']]
+    return response
+
 @timed
-def denodo_query(natural_language_query, api_host, username, password, plot = 0, plot_details = ''):
-    request_params = {
+def denodo_query(natural_language_query, api_host, username, password, database_names = None, tag_names = None, plot = 0, plot_details = '', custom_instructions = ''):
+    request_body = {
         'question': natural_language_query,
         'mode': 'data',
         'verbose': False,
         'plot': bool(plot),
-        'plot_details': plot_details
+        'plot_details': plot_details,
+        'custom_instructions': custom_instructions,
     }
 
-    try:
-        response = requests.get(
-            f'{api_host}/answerQuestion',
-            params=request_params,
-            auth=(username, password),
-            verify=False
-        )
-        response.raise_for_status()
-        json_data = response.json()
+    if database_names:
+        request_body['vdp_database_names'] = ",".join(database_names)
+    if tag_names:
+        request_body['vdp_tag_names'] = ",".join(tag_names)
+    
+    endpoint = f'{api_host}/answerQuestion'
+    response = make_ai_sdk_request(endpoint, request_body, (username, password))
+    
+    if isinstance(response, dict):
+        # Remove unwanted keys
         keys_to_remove = {
             'answer', 
-            'tokens', 
             'sql_execution_time', 
             'vector_store_search_time', 
             'llm_time', 
-            'total_execution_time'
         }
         
-        # Remove unwanted keys
         for key in keys_to_remove:
-            json_data.pop(key, None)
-
-        return json_data
-    except requests.HTTPError as e:
-        if e.response.status_code == 401:
-            return "Authentication failed. Please check your Denodo Data Catalog credentials."
-        else:
-            return f"An unexpected error occurred when connecting to VDP: {e}"
-    except Exception as e:
-        return f"Failed to lookup the Denodo database: {e}"
+            response.pop(key, None)
+    
+    return response

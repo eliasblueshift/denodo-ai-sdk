@@ -14,8 +14,6 @@
   }
   .csv-link {
     display: block;
-    margin-top: 8px;
-    margin-bottom: 8px;
   }
   .cursor-pointer {
     cursor: pointer;
@@ -84,13 +82,71 @@
     gap: 4px;
     margin-top: 4px;
   }
-  .context-badge {
-    margin-bottom: 4px !important;
-    white-space: normal;
-    text-align: left;
-    height: auto !important;
-    padding: 5px 10px;
-    display: inline-flex;
-    align-items: center;
+
+  .card-body .card-text pre,
+  .card-body .card-text table {
+    max-width: 100%; 
+    overflow-x: auto; 
+    display: block; 
   }
-  
+
+  .card-body .card-text table {
+    border-collapse: collapse;
+    margin-bottom: 1rem;
+  }
+
+  .card-body .card-text pre::-webkit-scrollbar,
+  .card-body .card-text table::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  .card-body .card-text pre::-webkit-scrollbar-track,
+  .card-body .card-text table::-webkit-scrollbar-track {
+    background: #444; 
+    border-radius: 4px;
+  }
+
+  .card-body .card-text pre::-webkit-scrollbar-thumb,
+  .card-body .card-text table::-webkit-scrollbar-thumb {
+    background: #888; 
+    border-radius: 4px;
+  }
+
+  .card-body .card-text pre::-webkit-scrollbar-thumb:hover,
+  .card-body .card-text table::-webkit-scrollbar-thumb:hover {
+    background: #aaa;
+  }
+
+  .markdown-container {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+
+  .markdown-container table {
+    max-width: none; 
+    border-collapse: collapse;
+    margin-bottom: 1rem;
+  }
+
+  .markdown-container::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  .markdown-container::-webkit-scrollbar-track {
+    background: #444;
+    border-radius: 4px;
+  }
+
+  .markdown-container::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+  }
+
+  .markdown-container::-webkit-scrollbar-thumb:hover {
+    background: #aaa;
+  }
+
+  .card-content-area {
+    min-width: 0; /* Allows flex items to shrink below their content size */
+  }  

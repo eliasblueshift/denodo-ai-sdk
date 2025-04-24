@@ -1,11 +1,15 @@
 ai_sdk_vector_store/
+ai_sdk_sample_data/
 node_modules/
 __pycache__/
 embeddings/
 uploads/
+reports/
+tests/
 logs/
 venv/
 env/
+google_service_account.json
 package-lock.json
 chatbot_config.env
 sdk_config.env

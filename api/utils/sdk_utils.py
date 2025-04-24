@@ -2,11 +2,15 @@ import os
 import re
 import sys
 import random
+import inspect
 import uvicorn
 import logging
 import requests
+import functools
+import traceback
 
 from time import time
+from fastapi import HTTPException
 from contextlib import contextmanager
 
 def add_tokens(token_set1, token_set2):
@@ -236,8 +240,8 @@ def filter_non_allowed_associations(view_json, valid_view_ids):
 def configure_uvicorn_logging():
     """Configure Uvicorn's logging to use our format."""
     log_config = uvicorn.config.LOGGING_CONFIG
-    timestamp_fmt = "%(asctime)s [Worker %(process)d] %(levelname)-8s %(message)s"
-    date_fmt = "%Y-%m-%d %H:%M:%S"
+    timestamp_fmt = "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s"
+    date_fmt = "%Y-%m-%d %H:%M:%S %z"
 
     # Update all formatters
     for formatter in log_config["formatters"].values():
@@ -245,22 +249,69 @@ def configure_uvicorn_logging():
         formatter["datefmt"] = date_fmt
 
     # The access formatter needs special handling to preserve request information
-    log_config["formatters"]["access"]["fmt"] = "%(asctime)s [Worker %(process)d] %(levelname)-8s %(client_addr)s - \"%(request_line)s\" %(status_code)s"
+    log_config["formatters"]["access"]["fmt"] = "[%(asctime)s] [%(process)d] [%(levelname)s] %(client_addr)s - \"%(request_line)s\" %(status_code)s"
     
-    # Set up a custom filter to only allow INFO level logs
-    class InfoOnlyFilter(logging.Filter):
-        def filter(self, record):
-            return record.levelno == logging.INFO
-
-    # Apply the filter to all handlers
-    for handler in log_config["handlers"].values():
-        handler["filters"] = ["info_only"]
-    
-    # Add the filter to the filters section
-    log_config["filters"] = {
-        "info_only": {
-            "()": InfoOnlyFilter,
-        }
-    }
-
     return log_config
+
+def handle_endpoint_error(endpoint_name):
+    def decorator(func):
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except requests.exceptions.HTTPError as he:
+                if he.response.status_code == 401:
+                    raise HTTPException(status_code=401, detail="Unauthorized")
+                else:
+                    error_details = {
+                        'error': str(he),
+                        'traceback': traceback.format_exc()
+                    }
+                    logging.error(f"HTTP Error in {endpoint_name}: {error_details}")
+                    raise HTTPException(status_code=he.response.status_code, detail=error_details)
+            except HTTPException as hex:
+                # Log the HTTPException but pass it through
+                logging.error(f"HTTPException in {endpoint_name}: {str(hex.detail)}")
+                raise
+            except Exception as e:
+                error_details = {
+                    'error': str(e),
+                    'traceback': traceback.format_exc()
+                }
+                logging.error(f"Error in {endpoint_name}: {error_details}")
+                raise HTTPException(status_code=500, detail=error_details)
+
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except requests.exceptions.HTTPError as he:
+                if he.response.status_code == 401:
+                    logging.error(f"Authentication error in {endpoint_name}: {str(he)}")
+                    raise HTTPException(status_code=401, detail="Unauthorized")
+                else:
+                    error_details = {
+                        'error': str(he),
+                        'traceback': traceback.format_exc()
+                    }
+                    logging.error(f"HTTP Error in {endpoint_name}: {error_details}")
+                    raise HTTPException(status_code=he.response.status_code, detail=error_details)
+            except HTTPException as hex:
+                # Log the HTTPException but pass it through
+                logging.error(f"HTTPException in {endpoint_name}: {str(hex.detail)}")
+                raise
+            except Exception as e:
+                error_details = {
+                    'error': str(e),
+                    'traceback': traceback.format_exc()
+                }
+                logging.error(f"Error in {endpoint_name}: {error_details}")
+                raise HTTPException(status_code=500, detail=error_details)
+
+        # Choose the appropriate wrapper based on whether the function is a coroutine
+        if inspect.iscoroutinefunction(func):
+            return async_wrapper
+        else:
+            return sync_wrapper
+
+    return decorator

@@ -39,7 +39,10 @@ def get_views_metadata_documents(
     filter_tables=None,
     server_id=DATA_CATALOG_SERVER_ID,
     verify_ssl=DATA_CATALOG_VERIFY_SSL,
-    metadata_url=DATA_CATALOG_METADATA_URL
+    metadata_url=DATA_CATALOG_METADATA_URL,
+    last_update_timestamp_ms=None,
+    view_prefix_filter='',
+    view_suffix_filter=''
 ):
     """
     Retrieve JSON documents from views metadata with support for OAuth token or Basic auth.
@@ -78,6 +81,9 @@ def get_views_metadata_documents(
             "dataMode": data_mode,
             "dataUsage": examples_per_table > 0,
         }
+
+        if last_update_timestamp_ms:
+            data["updatedSince"] = last_update_timestamp_ms
         
         # Add the appropriate parameter based on data_mode
         if data_mode == 'DATABASE':
@@ -174,14 +180,14 @@ def get_views_metadata_documents(
             use_associations=table_associations,
             use_descriptions=table_descriptions,
             use_column_descriptions=table_column_descriptions,
-            filter_tables=filter_tables or []
+            filter_tables=filter_tables or [],
+            view_prefix_filter=view_prefix_filter,
+            view_suffix_filter=view_suffix_filter
         )
 
     except requests.HTTPError as e:
         error_response = json.loads(e.response.text)
-        error_message = parse_execution_error(
-            error_response.get('message', 'Data Catalog did not return further details')
-        )
+        error_message = str(error_response.get('message', 'Data Catalog did not return further details'))
         logging.error("Data Catalog views metadata request failed: %s", error_message)
         raise
 
@@ -247,7 +253,7 @@ async def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CAT
         try:
             error_text = await e.response.text()
             error_response = json.loads(error_text)
-            error_message = parse_execution_error(error_response.get('message', 'Data Catalog did not return further details'))
+            error_message = str(error_response.get('message', 'Data Catalog did not return further details'))
         except (json.JSONDecodeError, AttributeError):
             error_message = f"HTTP Error: {e.status} - {e.message}"
         logging.error(f"Data Catalog execute VQL failed: {error_message}")
@@ -261,25 +267,21 @@ async def execute_vql(vql, auth, limit=EXECUTE_VQL_LIMIT, execution_url=DATA_CAT
 @timed
 async def get_allowed_view_ids(
     auth,
-    database_names=None,
-    tag_names=None,
     server_id=DATA_CATALOG_SERVER_ID,
     permissions_url=DATA_CATALOG_PERMISSIONS_URL,
     verify_ssl=DATA_CATALOG_VERIFY_SSL
 ):
     """
-    Retrieve allowed view IDs for given databases.
+    Retrieve allowed view IDs for all views accessible to the user.
 
     Args:
         auth: Either (username, password) tuple for basic auth or OAuth token string
-        database_names: List of database names to query
-        tag_names: List of tag names to query
         server_id: The server ID (default is DATA_CATALOG_SERVER_ID)
         permissions_url: The Data Catalog permissions URL
         verify_ssl: Whether to verify SSL certificates
 
     Returns:
-       List of allowed view IDs across all databases
+       List of unique allowed view IDs across all accessible views
     """
     # Prepare headers based on auth type
     headers = {
@@ -292,16 +294,11 @@ async def get_allowed_view_ids(
         )
     }
 
-    async def fetch_view_ids(session, name, type='DATABASE'):
-        data = {
-            "dataMode": type,
-        }
-        if type == 'DATABASE':
-            data["databaseNames"] = [name]
-        else:
-            data["tagNames"] = [name]
+    # Use "ALL" data mode to fetch all accessible view IDs in a single request
+    data = {"dataMode": "ALL"}
 
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{permissions_url}?serverId={server_id}",
                 json=data,
@@ -312,34 +309,24 @@ async def get_allowed_view_ids(
                 view_ids = await response.json()
                 
                 if not isinstance(view_ids, list) or not all(isinstance(id, int) for id in view_ids):
-                    raise ValueError(f"Unexpected response format for {name}: not a list of integers")
+                    raise ValueError("Unexpected response format: not a list of integers")
                 
-                return view_ids
-        except (aiohttp.ClientError, ValueError) as e:
-            logging.error(f"Failed to retrieve allowed view IDs for {name}: {str(e)}")
-            return None
-
-    # Use aiohttp for concurrent requests
-    allowed_view_ids = []
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        # Create tasks for databases
-        if database_names:
-            tasks.extend([fetch_view_ids(session, db, 'DATABASE') for db in database_names])
-        # Create tasks for tags
-        if tag_names:
-            tasks.extend([fetch_view_ids(session, tag, 'TAG') for tag in tag_names])
-        
-        # Execute all tasks concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        
-        # Collect results
-        for view_ids in results:
-            if view_ids:
-                allowed_view_ids.extend(view_ids)
-
-    unique_view_ids = list(set(allowed_view_ids))
-    return unique_view_ids
+                # Ensure unique values
+                unique_view_ids = list(set(view_ids))
+                return unique_view_ids
+                
+    except aiohttp.ClientResponseError as e:
+        try:
+            error_text = await e.response.text()
+            error_response = json.loads(error_text)
+            error_message = f"Failed to retrieve allowed view IDs: {error_response.get('message', 'Data Catalog did not return further details')}"
+        except (json.JSONDecodeError, AttributeError):
+            error_message = f"HTTP Error: {e.status} - {e.message}"
+        logging.error(error_message)
+        return []
+    except (aiohttp.ClientError, ValueError) as e:
+        logging.error(f"Failed to retrieve allowed view IDs: {str(e)}")
+        return []
 
 # This method calculates the authorization header for the Data Catalog REST API
 def calculate_basic_auth_authorization_header(user, password):
@@ -357,7 +344,15 @@ def remove_none_values(json_dict):
         return json_dict
 
 # Parse the Metadata JSON with more readable format
-def parse_metadata_json(json_response, use_associations = True, use_descriptions = True, use_column_descriptions = True, filter_tables = []):
+def parse_metadata_json(
+    json_response,
+    use_associations = True,
+    use_descriptions = True,
+    use_column_descriptions = True,
+    filter_tables = [],
+    view_prefix_filter='',
+    view_suffix_filter=''
+):
     # Denodo 9.1.0 onwards, the response is wrapped in viewsDetails
     if 'viewsDetails' in json_response:
         json_response = json_response['viewsDetails']
@@ -375,6 +370,12 @@ def parse_metadata_json(json_response, use_associations = True, use_descriptions
         if json_table['name'] in filter_tables:
             continue
 
+        if view_prefix_filter and not json_table['name'].startswith(view_prefix_filter):
+            continue
+
+        if view_suffix_filter and not json_table['name'].endswith(view_suffix_filter):
+            continue
+
         if 'viewFieldDataList' in json_table:
             output_table = {
                 'tableName': table_name,
@@ -383,11 +384,10 @@ def parse_metadata_json(json_response, use_associations = True, use_descriptions
 
             sample_data_dict = {}
             for example in json_table['viewFieldDataList']:
-                    sample_data_dict[example['fieldName']] = example['fieldValues']
-
+                    sample_data_dict[example['fieldName'].strip('"')] = example['fieldValues']
             # Combine the example data with the schema
             for field in json_table['schema']:
-                field_name = field['name']
+                field_name = field['name'].strip('"')
                 if field_name in sample_data_dict:
                     field['sample_data'] = sample_data_dict[field_name]
                 else:
@@ -423,9 +423,16 @@ def parse_metadata_json(json_response, use_associations = True, use_descriptions
                 for association in json_table['associationData']:
                     other_table = association['viewDetailsOfTheOtherView']['name']
                     other_table_db = association['viewDetailsOfTheOtherView']['databaseName']
-                    mapping = association['mapping']
+                    mapping = association['mapping'].replace('"', '')
                     mapping = mapping.split("=")
-                    mapping = [f"{other_table_db}.{table}" for table in mapping]
+
+                    for i in range(len(mapping)):
+                        table_name = mapping[i].split(".")[0]
+                        if table_name != other_table:
+                            mapping[i] = f"{json_response[0]['databaseName']}.{mapping[i]}"
+                        else:
+                            mapping[i] = f"{other_table_db}.{mapping[i]}"
+
                     mapping = " = ".join(mapping)
                     association_data = {
                         'table_name': f"{other_table_db}.{other_table}",
@@ -454,7 +461,3 @@ def parse_execution_json(json_response):
             })
 
     return parsed_data
-
-# Parse Execution Error
-def parse_execution_error(execution_error):
-    return execution_error.split('\n')[0]

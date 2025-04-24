@@ -10,7 +10,6 @@
 """
 
 import os
-import traceback
 
 from pydantic import BaseModel, Field
 from typing import Dict, Annotated, List, Literal
@@ -20,7 +19,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPAuthorizationCredentials, HTTPBearer
 
-from api.utils.sdk_utils import timing_context, add_tokens
+from api.utils.sdk_utils import timing_context, add_tokens, handle_endpoint_error
 from api.utils import sdk_ai_tools
 from api.utils import sdk_answer_question
 
@@ -77,6 +76,7 @@ class answerQuestionUsingViewsResponse(BaseModel):
         response_class = JSONResponse,
         response_model = answerQuestionUsingViewsResponse,
         tags = ['Ask a Question - Custom Vector Store'])
+@handle_endpoint_error("answerQuestionUsingViews")
 def answerQuestionUsingViews(endpoint_request: answerQuestionUsingViewsRequest, auth: str = Depends(authenticate)):
     """
     The only difference between this endpoint and `answerQuestion` is that this endpoint 
@@ -99,44 +99,35 @@ def answerQuestionUsingViews(endpoint_request: answerQuestionUsingViewsRequest, 
     As you can see, you can specify a different provider for SQL generation and chat generation. This is because generating a correct SQL query
     is a complex task that should be handled with a powerful LLM."""
 
-    try:
-        timings = {}
-        with timing_context("llm_time", timings):
-            category, category_response, category_related_questions, sql_category_tokens = sdk_ai_tools.sql_category(
-                query=endpoint_request.question, 
-                vector_search_tables=endpoint_request.vector_search_tables, 
-                llm_provider=endpoint_request.chat_provider,
-                llm_model=endpoint_request.chat_model,
-                mode=endpoint_request.mode,
-                custom_instructions=endpoint_request.custom_instructions
-            )
+    timings = {}
+    with timing_context("llm_time", timings):
+        category, category_response, category_related_questions, sql_category_tokens = sdk_ai_tools.sql_category(
+            query=endpoint_request.question, 
+            vector_search_tables=endpoint_request.vector_search_tables, 
+            llm_provider=endpoint_request.chat_provider,
+            llm_model=endpoint_request.chat_model,
+            mode=endpoint_request.mode,
+            custom_instructions=endpoint_request.custom_instructions
+        )
 
-        if category == "SQL":
-            response = sdk_answer_question.process_sql_category(
-                request=endpoint_request, 
-                vector_search_tables=endpoint_request.vector_search_tables, 
-                category_response=category_response,
-                auth=auth, 
-                timings=timings
-            )
-            response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
-        elif category == "METADATA":
-            response = sdk_answer_question.process_metadata_category(
-                category_response=category_response, 
-                category_related_questions=category_related_questions, 
-                vector_search_tables=endpoint_request.vector_search_tables, 
-                tokens=sql_category_tokens,
-                timings=timings
-            )
-        else:
-            response = sdk_answer_question.process_unknown_category(timings=timings)
+    if category == "SQL":
+        response = sdk_answer_question.process_sql_category(
+            request=endpoint_request, 
+            vector_search_tables=endpoint_request.vector_search_tables, 
+            category_response=category_response,
+            auth=auth, 
+            timings=timings
+        )
+        response['tokens'] = add_tokens(response['tokens'], sql_category_tokens)
+    elif category == "METADATA":
+        response = sdk_answer_question.process_metadata_category(
+            category_response=category_response, 
+            category_related_questions=category_related_questions, 
+            vector_search_tables=endpoint_request.vector_search_tables, 
+            tokens=sql_category_tokens,
+            timings=timings
+        )
+    else:
+        response = sdk_answer_question.process_unknown_category(timings=timings)
 
-        return JSONResponse(content=jsonable_encoder(response), media_type='application/json')
-    except Exception as e:
-
-        error_details = {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-        raise HTTPException(status_code=500, detail=error_details)
+    return JSONResponse(content=jsonable_encoder(response), media_type='application/json')

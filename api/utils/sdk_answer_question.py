@@ -12,7 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from api.utils.sdk_utils import timing_context, is_data_complex, add_tokens
 
-async def process_sql_category(request, vector_search_tables, category_response, auth, timings, session_id = None):
+async def process_sql_category(request, vector_search_tables, category_response, auth, timings, session_id = None, sample_data = None):
     with timing_context("llm_time", timings):
         vql_query, query_explanation, query_to_vql_tokens = await sdk_ai_tools.query_to_vql(
             query=request.question, 
@@ -21,16 +21,19 @@ async def process_sql_category(request, vector_search_tables, category_response,
             llm_model=request.sql_gen_model, 
             filter_params=category_response,
             custom_instructions=request.custom_instructions,
-            session_id=session_id
+            session_id=session_id,
+            sample_data=sample_data
         )
 
         vql_query, _, query_fixer_tokens = await sdk_ai_tools.query_fixer(
             question=request.question,
             query=vql_query, 
+            query_explanation=query_explanation,
             llm_provider=request.sql_gen_provider, 
             llm_model=request.sql_gen_model,
             session_id=session_id,
-            vector_search_tables=vector_search_tables
+            vector_search_tables=vector_search_tables,
+            sample_data=sample_data
         )
 
     max_attempts = 2
@@ -46,8 +49,10 @@ async def process_sql_category(request, vector_search_tables, category_response,
             timings=timings,
             vector_search_tables=vector_search_tables,
             session_id=session_id,
+            query_explanation=query_explanation,
             query_fixer_tokens=query_fixer_tokens,
-            fixer_history=fixer_history
+            fixer_history=fixer_history,
+            sample_data=sample_data
         )
         
         if vql_query == 'OK':
@@ -95,7 +100,8 @@ async def process_sql_category(request, vector_search_tables, category_response,
             vector_search_tables=vector_search_tables, 
             data_file=data_file, 
             timings=timings,
-            session_id=session_id
+            session_id=session_id,
+            sample_data=sample_data
         )
 
     if request.disclaimer:
@@ -142,7 +148,7 @@ def process_unknown_category(timings):
         'total_execution_time': round(sum(timings.values()), 2) if timings else 0
     }
 
-async def attempt_query_execution(vql_query, request, auth, timings, vector_search_tables, session_id, query_fixer_tokens=None, fixer_history=[]):
+async def attempt_query_execution(vql_query, request, auth, timings, vector_search_tables, session_id, query_explanation, query_fixer_tokens=None, fixer_history=[], sample_data=None):
     if vql_query:
         execution_result, vql_status_code, timings = await execute_query(
             vql_query=vql_query, 
@@ -178,12 +184,14 @@ async def attempt_query_execution(vql_query, request, auth, timings, vector_sear
                 vql_query, fixer_history, query_fixer_tokens = await sdk_ai_tools.query_fixer(
                     question=request.question,
                     query=vql_query, 
+                    query_explanation=query_explanation,
                     error_log=execution_result,
                     llm_provider=request.sql_gen_provider,
                     llm_model=request.sql_gen_model,
                     session_id=session_id,
                     vector_search_tables=vector_search_tables,
-                    fixer_history=fixer_history
+                    fixer_history=fixer_history,
+                    sample_data=sample_data
                 )            
         elif vql_status_code == 499:
             with timing_context("llm_time", timings):
@@ -194,7 +202,8 @@ async def attempt_query_execution(vql_query, request, auth, timings, vector_sear
                     llm_model=request.sql_gen_model,
                     vector_search_tables=vector_search_tables,
                     session_id=session_id,
-                    fixer_history=fixer_history
+                    fixer_history=fixer_history,
+                    sample_data=sample_data
                 )
             
             query_fixer_tokens = add_tokens(query_fixer_tokens or {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}, 
@@ -235,6 +244,9 @@ def handle_plotting(request, execution_result):
     return '', data_file, request
 
 def prepare_response(vql_query, query_explanation, tokens, execution_result, vector_search_tables, raw_graph, timings):
+    #Remove conditions from query explanation as it contains sample data the final user might not have access to
+    if "Conditions:" in query_explanation:
+        query_explanation = query_explanation.split("Conditions:")[0].strip()
     return {
         "answer": vql_query,
         "sql_query": vql_query if "FROM" in vql_query else "",
@@ -250,7 +262,7 @@ def prepare_response(vql_query, query_explanation, tokens, execution_result, vec
         "total_execution_time": round(sum(timings.values()), 2)
     }
 
-async def enhance_verbose_response(request, response, vql_query, llm_execution_result, vector_search_tables, data_file, timings, session_id = None):
+async def enhance_verbose_response(request, response, vql_query, llm_execution_result, vector_search_tables, data_file, timings, session_id = None, sample_data = None):
     with timing_context("llm_time", timings):
         tasks = []
         
@@ -286,7 +298,8 @@ async def enhance_verbose_response(request, response, vql_query, llm_execution_r
                 llm_provider=request.chat_provider,
                 llm_model=request.chat_model,
                 custom_instructions=request.custom_instructions,
-                session_id=session_id
+                session_id=session_id,
+                sample_data=sample_data
             )
             tasks.append(answer_task)
             tasks.append(related_questions_task)

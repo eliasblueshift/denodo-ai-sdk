@@ -1,4 +1,5 @@
 import os
+import httpx
 import logging
 
 from utils.utils import TokenCounter, RefreshableBotoSession
@@ -15,7 +16,8 @@ class UniformLLM:
         "Groq",
         "Ollama",
         "Mistral",
-        "SambaNova"
+        "SambaNova",
+        "OpenRouter"
         ]
     
     def __init__(self, provider_name, model_name, temperature = 0, max_tokens = 2048): 
@@ -41,7 +43,6 @@ class UniformLLM:
             logging.info(f"- {self.provider_name.upper()}_BASE_URL (required)")
             logging.info(f"- {self.provider_name.upper()}_PROXY (optional)")
             self.setup_custom()
-            return
 
         if self.provider_name.lower() == "openai":
             self.setup_openai()
@@ -65,6 +66,38 @@ class UniformLLM:
             self.setup_google_ai_studio()
         elif self.provider_name.lower() == "sambanova":
             self.setup_sambanova()
+        elif self.provider_name.lower() == "openrouter":
+            self.setup_openrouter()
+
+    def setup_openrouter(self):
+        from langchain_openai import ChatOpenAI
+
+        api_key = os.getenv('OPENROUTER_API_KEY')
+        base_url = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
+        preferred_providers = os.getenv('OPENROUTER_PREFERRED_PROVIDERS')
+
+        if api_key is None:
+            raise ValueError("OPENROUTER_API_KEY environment variable not set.")
+
+        kwargs = {
+            "model": self.model_name,
+            "api_key": api_key,
+            "base_url": base_url,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+
+        if preferred_providers:
+            preferred_providers = preferred_providers.split(',')
+            kwargs["extra_body"] = {
+                "provider": {
+                    "order": preferred_providers,
+                    "allow_fallbacks": True
+                }
+            }
+
+        self.llm = ChatOpenAI(**kwargs)
+        self.callback = TokenCounter(llm = self)
 
     def setup_sambanova(self):
         from langchain_sambanova import ChatSambaNovaCloud
@@ -191,7 +224,7 @@ class UniformLLM:
 
         api_key = os.getenv('OPENAI_API_KEY')
         base_url = os.getenv('OPENAI_BASE_URL')
-        proxy = os.getenv('OPENAI_PROXY')
+        proxy = os.getenv('OPENAI_PROXY_URL')
         organization_id = os.getenv('OPENAI_ORG_ID')
 
         if api_key is None:
@@ -217,7 +250,11 @@ class UniformLLM:
             kwargs["base_url"] = base_url
 
         if proxy is not None:
-            kwargs["openai_proxy"] = proxy
+            _http_client = httpx.Client(proxy = proxy, verify = False)
+            _http_async_client = httpx.AsyncClient(proxy = proxy, verify = False)
+
+            kwargs["http_client"] = _http_client
+            kwargs["http_async_client"] = _http_async_client
 
         if organization_id is not None:
             kwargs["organization"] = organization_id
@@ -252,7 +289,11 @@ class UniformLLM:
             logging.warning("AzureOpenAI API key not set. Using default authentication.")
 
         if api_proxy is not None:
-            kwargs["openai_proxy"] = api_proxy
+            _http_client = httpx.Client(proxy = api_proxy, verify = False)
+            _http_async_client = httpx.AsyncClient(proxy = api_proxy, verify = False)
+
+            kwargs["http_client"] = _http_client
+            kwargs["http_async_client"] = _http_async_client
         else:
             logging.warning("AzureOpenAI proxy not set. Using direct connection.")
 
@@ -323,7 +364,7 @@ class UniformLLM:
             "model": self.model_name,
             "api_key": api_key,
             "base_url": base_url,
-            "temperature": self.temperature * 2,
+            "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
 

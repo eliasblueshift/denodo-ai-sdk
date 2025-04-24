@@ -1,3 +1,34 @@
+version 0.7 - 20250421
+------------------------
+
+- Fixed bug in the chatbot UI where the container would overflow when rendering a horizontal table
+- Forced chatbot LLM to correctly format numbers and percentages
+- Fixed bug in Windows where the chatbot would not automatically detect the encoding of CSV files
+- Change AI_SDK_HOST environment variable to AI_SDK_URL in the sample chatbot to not clash with the AI SDK HOST environment variable
+- Added dependency Uvicorn for production deployment on Windows
+
+version 0.7-beta - 20250411
+------------------------
+
+- Added dependency Gunicorn for production deployment
+- Added thumbs up/down feedback functionality in the sample chatbot
+- Added high availability setup/support for AI SDK
+- Added user context to queries for personalized results in the sample chatbot UI
+- Added support for OpenRouter provider
+- Included the Denodo Community (9.2-beta) CSV as an example of unstructured data
+- Incorporated a new report system to track user queries in the sample chatbot. Reports are saved in the reports folder.
+- Added option to sync tags in the SyncVectorDB button in the sample chatbot
+- Added possibility to disable the "Sync VectorDB" button in the sample chatbot
+- Added semantic search capability for sample data to improve accuracy
+- Extended view search across all databases with user permissions
+- Included additional information in the chatbot UI, like AI SDK token usage and execution time
+- Reduce chatbot history automatically based on token limits
+- Fixed error on Unstructured Data Load
+- Fixed AI SDK compatibility with AzureOpenAI when using proxy
+- Fixed embeddings_token_limit parameter functionality
+- Fixed vectorization issues with Unicode field names in metadata examples
+- Fixed issue where chatbot didn't respect /data /metadata forced routing
+
 version 0.6.2 - 20250403
 ------------------------
 
@@ -15,7 +46,6 @@ version 0.6.1 - 20250328
 - Fixed bug where the view description would not be sent to the LLM
 
 version 0.6 - 20250318
-------------------------
 
 ## MAIN CHANGES
 
